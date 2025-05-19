@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "code_assistant": "./src/code_assistant/graph.py:graph"
+  },
+  "env": ".env"
+}
