@@ -21,7 +21,6 @@ from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AnyMessage
-from langchain_core.retrievers import VectorStoreRetriever
 from langchain_core.vectorstores import VectorStoreRetriever
 
 

@@ -8,3 +8,6 @@ langchain_openai==0.3.17
 langchain_pinecone==0.2.6
 langgraph==0.4.5
 pydantic==2.11.4
+python-dotenv==1.0.1
+uvicorn==0.29.0
+gunicorn==21.2.0
