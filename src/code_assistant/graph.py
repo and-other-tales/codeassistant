@@ -6,7 +6,8 @@ for the code assistant using LangGraph.
 
 import re
 import json
-from typing import Dict, List, Optional, Any, cast, Tuple, Sequence
+from typing import Dict, List, Optional, Any, cast, Tuple, Sequence, Type, Callable
+import traceback
 
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.output_parsers import StrOutputParser
@@ -14,6 +15,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 from langgraph.graph import END, StateGraph, START
+from langchain_core.tools import Tool  # Use simple Tool instead of BaseTool
 
 from code_assistant.configuration import Configuration
 from code_assistant.state import CodeSolution, GraphState, InputState
@@ -34,15 +36,39 @@ from code_assistant.utils import (
     ingest_github_repo
 )
 
+from langchain.schema import Document
+
 
 class SearchQuery(BaseModel):
     """Search the indexed documents for a query."""
-    query: str
+    query: str = Field(..., description="The query to search for in the indexed documents.")
 
 
-class IngestGithubRepo(BaseModel):
-    """Ingest a GitHub repository for code/documentation search."""
+# Schema for GitHub repo ingestion
+class GithubRepoSchema(BaseModel):
+    """Schema for GitHub repository ingestion."""
     repo_url: str = Field(..., description="The URL of the GitHub repository to ingest.")
+
+
+# Define simplified helper functions for the tool
+def _github_repo_ingest_run(repo_url: str) -> str:
+    """Run GitHub repository ingestion synchronously (not implemented)."""
+    raise NotImplementedError("This tool only supports async execution")
+
+async def _github_repo_ingest_async_run(repo_url: str) -> str:
+    """Run GitHub repository ingestion asynchronously."""
+    if not repo_url:
+        raise ValueError("repo_url is required")
+    return f"Started ingestion of GitHub repository: {repo_url}"
+
+# Create the tool using the function-based approach
+IngestGithubRepo = Tool(
+    name="IngestGithubRepo",
+    description="Ingest a GitHub repository for code/documentation search",
+    func=_github_repo_ingest_run,
+    coroutine=_github_repo_ingest_async_run,
+    args_schema=GithubRepoSchema
+)
 
 
 async def process_documentation(
@@ -56,7 +82,6 @@ async def process_documentation(
         return {"documents": [], "messages": messages, "error": "No user input"}
     
     # For now, create a document from user input
-    from langchain_core.documents import Document
     doc = Document(page_content=user_input)
     return {"documents": [doc]}
 
@@ -91,9 +116,18 @@ async def generate_code(
             for tool_call in tool_calls:
                 formatted_call = format_tool_call(tool_call)
                 if formatted_call['name'] == 'IngestGithubRepo':
-                    args = formatted_call['arguments']
+                    # Get repo_url from arguments, handling both possible formats
+                    if isinstance(formatted_call.get('arguments'), dict):
+                        repo_url = formatted_call['arguments'].get('repo_url')
+                    else:
+                        # For backward compatibility or different format
+                        repo_url = formatted_call.get('repo_url')
+                    
+                    if not repo_url:
+                        raise ValueError("Missing repo_url in tool call arguments")
+                        
                     result = await ingest_github_repo(
-                        repo_url=args['repo_url'],
+                        repo_url=repo_url,
                         mongodb_uri=configuration.mongodb_uri,
                         pinecone_index=configuration.pinecone_index,
                         pinecone_api_key=configuration.pinecone_api_key,
@@ -101,6 +135,25 @@ async def generate_code(
                     )
                     # Handle the result which may be a boolean or a dictionary
                     status_message = "successful" if result == True or (isinstance(result, dict) and result.get('status') == 'success') else "failed"
+                    
+                    # Add more detailed error information
+                    detailed_message = ""
+                    if status_message == "failed":
+                        # Check for common configuration issues
+                        if not configuration.mongodb_uri:
+                            detailed_message += "MongoDB URI is not configured. "
+                        if not configuration.pinecone_index:
+                            detailed_message += "Pinecone index is not configured. "
+                        if not configuration.pinecone_api_key:
+                            detailed_message += "Pinecone API key is not configured. "
+                        
+                        # Add detailed_message only if there's content
+                        if detailed_message:
+                            status_message += f" (Reason: {detailed_message.strip()})"
+                        
+                        # Log the error details
+                        print(f"GitHub ingestion failed: {detailed_message}")
+                    
                     messages.append(AIMessage(content=f"GitHub repo ingestion complete: {status_message}"))
                     return {
                         "messages": messages,
@@ -109,7 +162,7 @@ async def generate_code(
                         "generation": None
                     }
         except Exception as e:
-            messages.append(AIMessage(content=f"Error during ingestion: {str(e)}"))
+            messages.append(AIMessage(content=f"Error during ingestion: {str(e)}\n{traceback.format_exc()}"))
             return {
                 "messages": messages,
                 "iterations": iterations,
@@ -245,15 +298,24 @@ async def generate_code(
                     messages.append(AIMessage(content=error_msg))
                     # We don't return here to allow the code to be returned with the errors
         
-        # Extract any tool calls
+        # Extract tool calls and handle them
         tool_calls = extract_tool_calls(result)
         for tool_call in tool_calls:
             formatted_call = format_tool_call(tool_call)
             if formatted_call['name'] == 'IngestGithubRepo':
                 # Handle additional ingestion requests
-                args = formatted_call['arguments']
+                # Get repo_url from arguments, handling both possible formats
+                if isinstance(formatted_call.get('arguments'), dict):
+                    repo_url = formatted_call['arguments'].get('repo_url')
+                else:
+                    # For backward compatibility or different format
+                    repo_url = formatted_call.get('repo_url')
+                
+                if not repo_url:
+                    raise ValueError("Missing repo_url in tool call arguments")
+                
                 ingestion_result = await ingest_github_repo(
-                    repo_url=args['repo_url'],
+                    repo_url=repo_url,
                     mongodb_uri=configuration.mongodb_uri,
                     pinecone_index=configuration.pinecone_index,
                     pinecone_api_key=configuration.pinecone_api_key,

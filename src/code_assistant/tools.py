@@ -20,6 +20,7 @@ import json
 from typing import Dict, List, Optional, Any, Union, Type, Sequence
 import traceback
 from pydantic import BaseModel
+from langchain_core.tools import BaseTool
 
 # Define ToolException locally to avoid import issues
 class ToolException(Exception):
@@ -29,7 +30,6 @@ class ToolException(Exception):
         self.recoverable = recoverable
 
 from langchain_core.messages import BaseMessage
-from langchain_core.tools import BaseTool
 
 
 def extract_required_modules(text: str) -> list[str]:
@@ -194,17 +194,58 @@ def format_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
         tool_call (Dict[str, Any]): The tool call to format.
         
     Returns:
-        Dict[str, Any]: Formatted tool call.
+        Dict[str, Any]: Formatted tool call with name and arguments.
     """
-    if "function" in tool_call:
-        # Handle OpenAI-style tool calls
-        function = tool_call["function"]
+    try:
+        if "function" in tool_call:
+            # Handle OpenAI-style tool calls
+            function = tool_call["function"]
+            name = function.get("name", "")
+            
+            # Handle arguments with proper error handling
+            arguments = {}
+            if "arguments" in function:
+                try:
+                    arg_str = function["arguments"]
+                    if arg_str and isinstance(arg_str, str):
+                        arguments = json.loads(arg_str)
+                    elif isinstance(arg_str, dict):
+                        # Already a dictionary
+                        arguments = arg_str
+                except json.JSONDecodeError:
+                    print(f"Warning: Could not decode tool call arguments: {function['arguments']}")
+                    arguments = {}
+                    
+            return {
+                "name": name,
+                "arguments": arguments,
+            }
+        elif "name" in tool_call and "args" in tool_call:
+            # Handle LangChain-style tool calls
+            return {
+                "name": tool_call["name"],
+                "arguments": tool_call["args"],
+            }
+        elif "name" in tool_call and "arguments" in tool_call:
+            # Handle tools that already have the right format
+            return {
+                "name": tool_call["name"],
+                "arguments": tool_call["arguments"],
+            }
+            
+        # Return a standardized structure for other formats
         return {
-            "name": function.get("name", ""),
-            "arguments": json.loads(function.get("arguments", "{}")),
+            "name": tool_call.get("name", ""),
+            "arguments": tool_call.get("args", tool_call.get("arguments", {}))
         }
-    # Return as-is for other formats
-    return tool_call
+    except Exception as e:
+        print(f"Error formatting tool call: {str(e)}")
+        print(f"Raw tool call: {tool_call}")
+        # Return a minimal valid structure to avoid downstream errors
+        return {
+            "name": "",
+            "arguments": {}
+        }
 
 
 def get_github_tools(user_consent: bool = False):
