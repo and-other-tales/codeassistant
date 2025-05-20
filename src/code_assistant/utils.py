@@ -17,6 +17,8 @@ Functions:
     ingest_github_repo: Ingest a GitHub repository into the document storage.
 """
 
+from __future__ import annotations
+
 import os
 import tempfile
 import shutil
@@ -28,22 +30,32 @@ import subprocess
 import json
 import asyncio
 import logging
-from typing import Any, Optional, Sequence, List, Dict, Union, Iterable, Tuple
+import datetime
+import importlib
+import ast
+from typing import Any, Optional, Sequence, List, Dict, Union, Iterable, Tuple, cast, Type
+from pathlib import Path
 
 from bs4 import BeautifulSoup as Soup
 from langchain.chat_models import init_chat_model
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AnyMessage, BaseMessage
+from langchain_core.messages import AnyMessage, BaseMessage, SystemMessage
 from langchain_core.vectorstores import VectorStoreRetriever
 from langchain_groq import ChatGroq
 from langchain_openai import OpenAIEmbeddings
-from langchain_pinecone import PineconeVectorStore
 from langchain_mongodb import MongoDBAtlasVectorSearch
 from pymongo import MongoClient
 import nbformat
-from pydantic import SecretStr
+
+# Handle different versions of Pinecone SDK
+try:
+    import pinecone
+    PINECONE_SDK_AVAILABLE = True
+except ImportError:
+    pinecone = None
+    PINECONE_SDK_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -172,9 +184,7 @@ def load_chat_model(fully_specified_name: str) -> BaseChatModel:
             if not api_key:
                 raise ValueError("GROQ_API_KEY environment variable must be set for Groq models.")
             
-            from langchain.pydantic_v1 import SecretStr
-            secret_key = SecretStr(api_key)
-            return ChatGroq(model=model, groq_api_key=secret_key)
+            return ChatGroq(model=model, groq_api_key=api_key)
         elif provider.lower() == "openai":
             return init_chat_model(model, model_provider="openai")
         elif provider.lower() == "anthropic":
@@ -332,17 +342,24 @@ def make_pinecone_retriever(
     Returns:
         VectorStoreRetriever: The configured retriever.
     """
-    from langchain_pinecone import PineconeVectorStore
-    
     search_kwargs = search_kwargs or {}
     
     search_filter = search_kwargs.setdefault("filter", {})
     search_filter.update({"user_id": user_id})
-    
-    vstore = PineconeVectorStore.from_existing_index(
-        os.environ["PINECONE_INDEX_NAME"], embedding=embedding_model
-    )
-    return vstore.as_retriever(search_kwargs=search_kwargs)
+
+    # Handle both old and new Pinecone SDK versions
+    try:
+        from langchain_pinecone import PineconeVectorStore
+        
+        # Initialize the vector store
+        vstore = PineconeVectorStore.from_existing_index(
+            os.environ["PINECONE_INDEX_NAME"], embedding=embedding_model
+        )
+        return vstore.as_retriever(search_kwargs=search_kwargs)
+    except ImportError:
+        logger.warning("Failed to import langchain_pinecone. Falling back to alternative retriever.")
+        # Fall back to MongoDB retriever or other alternative
+        return make_mongodb_retriever(user_id, embedding_model, search_kwargs)
 
 
 def make_mongodb_retriever(

@@ -44,6 +44,9 @@ def extract_required_modules(text: str) -> list[str]:
     Returns:
         list[str]: A list of unique module names.
     """
+    # First, normalize indentation by removing leading spaces from each line
+    normalized_text = "\n".join(line.lstrip() for line in text.split("\n"))
+    
     # Patterns to match various import formats
     import_patterns = [
         r'(?:^|\n)\s*import\s+([a-zA-Z0-9_.,\s]+)(?:$|\n)',                      # import module
@@ -55,7 +58,7 @@ def extract_required_modules(text: str) -> list[str]:
     # Extract all potential modules
     modules = []
     for pattern in import_patterns:
-        matches = re.findall(pattern, text)
+        matches = re.findall(pattern, normalized_text)
         for match in matches:
             if ',' in match:  # Handle multiple imports (import numpy, pandas)
                 modules.extend([m.strip() for m in match.split(',')])
@@ -65,11 +68,15 @@ def extract_required_modules(text: str) -> list[str]:
     # Clean up module names
     cleaned_modules = []
     for module in modules:
+        # Handle "import pandas as pd" format
+        if " as " in module:
+            module = module.split(" as ")[0].strip()
+            
         # Extract base module (e.g., 'pandas' from 'pandas.DataFrame')
-        base_module = module.split('.')[0]
+        base_module = module.split('.')[0].strip()
         
-        # Filter out common built-ins and empty strings
-        if base_module and base_module not in ['__future__', 'os', 'sys', 'typing', 're', 'json', 'math', 'time']:
+        # Add the base module if it's not empty
+        if base_module:
             cleaned_modules.append(base_module)
     
     # Return unique modules
