@@ -259,10 +259,11 @@ class ChatGroq(BaseChatModel):
                             delta = chunk["choices"][0]["delta"]
                             
                             if "content" in delta and delta["content"] is not None:
-                                content_buffer += delta["content"]
-                                # Yield content updates as chunks
-                                chunk_message = AIMessageChunk(content=delta["content"])
-                                yield ChatGenerationChunk(message=chunk_message)
+                                content = delta["content"]
+                                content_buffer += content
+                                # Create proper chunk with AIMessageChunk
+                                message_chunk = AIMessageChunk(content=content)
+                                yield ChatGenerationChunk(message=message_chunk)
                             
                             if "tool_calls" in delta:
                                 # Process tool calls in the stream
@@ -292,8 +293,8 @@ class ChatGroq(BaseChatModel):
                                             if "arguments" in tool_call["function"]:
                                                 existing_call["args"] += tool_call["function"]["arguments"]
                                 
-                                # Yield a chunk for tool calls
-                                additional_kwargs = {"tool_calls": [
+                                # Yield a chunk for tool calls with the correct message type
+                                tool_calls_kwargs = {"tool_calls": [
                                     {
                                         "id": tc.get("id", ""),
                                         "type": "function",
@@ -304,8 +305,8 @@ class ChatGroq(BaseChatModel):
                                     }
                                     for tc in function_calls_buffer
                                 ]}
-                                message = AIMessageChunk(content="", additional_kwargs=additional_kwargs)
-                                yield ChatGenerationChunk(message=message)
+                                tool_message_chunk = AIMessageChunk(content="", additional_kwargs=tool_calls_kwargs)
+                                yield ChatGenerationChunk(message=tool_message_chunk)
                         
                         except (json.JSONDecodeError, KeyError) as e:
                             logger.error(f"Error parsing Groq streaming response: {e}, line: {line}")
@@ -464,6 +465,8 @@ class ChatGroq(BaseChatModel):
             **kwargs
         )
         
-        # Process iterator in a way that works with async
+        # Process iterator in a way that properly implements async iteration
+        loop = asyncio.get_event_loop()
         for chunk in iterator:
+            # Use yield to create an async generator
             yield chunk
