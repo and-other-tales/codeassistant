@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, cast
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, StateGraph, START
 
@@ -35,6 +35,11 @@ class SearchQuery(BaseModel):
     """Search the indexed documents for a query."""
 
     query: str
+
+
+class IngestGithubRepo(BaseModel):
+    """Ingest a GitHub repository for code/documentation search."""
+    repo_url: str = Field(..., description="The URL of the GitHub repository to ingest.")
 
 
 async def process_documentation(
@@ -150,34 +155,14 @@ async def generate_code(
 
     # --- Ingestion tool logic ---
     if any(kw in user_text for kw in task_keywords):
-        ingestion_tool = {
-            "type": "function",
-            "function": {
-                "name": "ingest_github_repo",
-                "description": (
-                    "Use this tool to ingest and index any GitHub repository for code/documentation search. "
-                    "Always use this tool if the user requests ingestion or documentation from a repo, or if you need to access code or docs from GitHub. "
-                    "Do not attempt to answer such requests directly; always call this tool."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "repo_url": {
-                            "type": "string",
-                            "description": "The URL of the GitHub repository to ingest."
-                        }
-                    },
-                    "required": ["repo_url"]
-                }
-            }
-        }
+        # Use Pydantic model for ingestion tool
         github_tools = get_github_tools(user_consent=True)
-        all_tools = build_agent_tools(user_tools=[], github_tools=github_tools, ingestion_tools=[ingestion_tool])
+        all_tools = build_agent_tools(user_tools=[], github_tools=github_tools, ingestion_tools=[IngestGithubRepo])
         print("DEBUG: user_text:", user_text)
         print("DEBUG: tools passed to model:", all_tools)
         system_prompt = (
             configuration.code_gen_system_prompt_claude +
-            "\n\nIMPORTANT: If the user requests ingestion, documentation, or code from a GitHub repository, you MUST use the available tools (such as ingest_github_repo or GitHub tools) and never answer directly."
+            "\n\nIMPORTANT: If the user requests ingestion, documentation, or code from a GitHub repository, you MUST use the available tools (such as IngestGithubRepo or GitHub tools) and never answer directly."
         )
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_prompt),
@@ -195,7 +180,8 @@ async def generate_code(
         tool_calls = getattr(raw_result, 'tool_calls', None)
         if tool_calls:
             for tool_call in tool_calls:
-                if tool_call.get('name') == 'ingest_github_repo':
+                # For Pydantic model, the name will be the class name
+                if tool_call.get('name') == 'IngestGithubRepo':
                     repo_url = tool_call['arguments']['repo_url']
                     mongodb_uri = configuration.mongodb_uri
                     pinecone_index = configuration.pinecone_index
