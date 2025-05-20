@@ -445,76 +445,82 @@ async def ingest_github_repo(
         repo_owner = repo_parts[3]
         repo_name = repo_parts[4]
         
-        # Create a temporary directory for cloning the repo
-        with tempfile.TemporaryDirectory() as temp_dir:
-            try:
-                # Clone the repository using GitLoader
-                loader = GitLoader(
-                    clone_url=repo_url,
-                    repo_path=temp_dir,
-                    branch="main"
-                )
-                
-                # Load and split documents
-                documents = loader.load()
-                
-                # Add metadata to documents
-                for doc in documents:
-                    metadata = doc.metadata or {}
-                    metadata.update({
-                        "source": "github",
-                        "repo_owner": repo_owner,
-                        "repo_name": repo_name,
-                        "module": repo_name
-                    })
-                    doc.metadata = metadata
-                
-                # Split documents into chunks
-                text_splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=1000,
-                    chunk_overlap=200
-                )
-                chunks = text_splitter.split_documents(documents)
-                
-                # Initialize MongoDB client
-                client = MongoClient(mongodb_uri)
-                db = client.get_default_database()
-                collection = db.documents
-                
-                # Check if documents from this repo already exist
-                existing = collection.count_documents({
-                    "metadata.repo_owner": repo_owner,
-                    "metadata.repo_name": repo_name
-                })
-                
-                if existing > 0:
-                    logger.info(f"Repository {repo_owner}/{repo_name} already exists in MongoDB")
-                    # Optionally, delete existing documents before re-ingesting
-                    collection.delete_many({
+        # Define the blocking operations to be run in a separate thread
+        def clone_and_process_repo():
+            # Create a temporary directory for cloning the repo
+            with tempfile.TemporaryDirectory() as temp_dir:
+                try:
+                    # Clone the repository using GitLoader
+                    loader = GitLoader(
+                        clone_url=repo_url,
+                        repo_path=temp_dir,
+                        branch="main"
+                    )
+                    
+                    # Load and split documents
+                    documents = loader.load()
+                    
+                    # Add metadata to documents
+                    for doc in documents:
+                        metadata = doc.metadata or {}
+                        metadata.update({
+                            "source": "github",
+                            "repo_owner": repo_owner,
+                            "repo_name": repo_name,
+                            "module": repo_name
+                        })
+                        doc.metadata = metadata
+                    
+                    # Split documents into chunks
+                    text_splitter = RecursiveCharacterTextSplitter(
+                        chunk_size=1000,
+                        chunk_overlap=200
+                    )
+                    chunks = text_splitter.split_documents(documents)
+                    
+                    # Initialize MongoDB client
+                    client = MongoClient(mongodb_uri)
+                    db = client.get_default_database()
+                    collection = db.documents
+                    
+                    # Check if documents from this repo already exist
+                    existing = collection.count_documents({
                         "metadata.repo_owner": repo_owner,
                         "metadata.repo_name": repo_name
                     })
+                    
+                    if existing > 0:
+                        logger.info(f"Repository {repo_owner}/{repo_name} already exists in MongoDB")
+                        # Optionally, delete existing documents before re-ingesting
+                        collection.delete_many({
+                            "metadata.repo_owner": repo_owner,
+                            "metadata.repo_name": repo_name
+                        })
+                    
+                    # Initialize embeddings
+                    embeddings = HuggingFaceEmbeddings(
+                        model_name=embedding_model_name,
+                        encode_kwargs={"normalize_embeddings": True}
+                    )
+                    
+                    # Initialize vector store
+                    vector_store = MongoDBAtlasVectorSearch.from_documents(
+                        chunks,
+                        embeddings,
+                        collection=collection,
+                        index_name=pinecone_index
+                    )
+                    
+                    logger.info(f"Successfully ingested {len(chunks)} chunks from {repo_owner}/{repo_name}")
+                    return True
+                    
+                except Exception as e:
+                    logger.error(f"Error cloning or processing repository: {e}")
+                    return False
                 
-                # Initialize embeddings
-                embeddings = HuggingFaceEmbeddings(
-                    model_name=embedding_model_name,
-                    encode_kwargs={"normalize_embeddings": True}
-                )
-                
-                # Initialize vector store
-                vector_store = MongoDBAtlasVectorSearch.from_documents(
-                    chunks,
-                    embeddings,
-                    collection=collection,
-                    index_name=pinecone_index
-                )
-                
-                logger.info(f"Successfully ingested {len(chunks)} chunks from {repo_owner}/{repo_name}")
-                return True
-                
-            except Exception as e:
-                logger.error(f"Error cloning or processing repository: {e}")
-                return False
+        # Run the blocking operations in a separate thread to avoid blocking the event loop
+        return await asyncio.to_thread(clone_and_process_repo)
+        
     except Exception as e:
         logger.error(f"Error in ingest_github_repo: {e}")
         return False
