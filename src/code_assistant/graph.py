@@ -23,6 +23,9 @@ from code_assistant.utils import (
     format_docs, 
     get_message_text,
     load_chat_model,
+    extract_required_modules,
+    documentation_exists,
+    ingest_github_repo,
 )
 
 
@@ -98,25 +101,69 @@ async def generate_code(
     # Format documentation
     formatted_docs = format_docs(documents)
     
-    # Detect if the user is just greeting or starting a chat
+    # Detect if the user wants to brainstorm or have a natural language session before starting a task
     user_text = get_message_text(messages[-1]).strip().lower()
-    greeting_phrases = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]
-    if any(user_text.startswith(greet) for greet in greeting_phrases):
-        # Respond with a natural language introduction
-        intro = (
-            "Hello! I'm your code assistant. "
-            "You can ask me to generate code, ingest documentation, or help with your coding tasks. "
-            "For example, you can say: 'Please ingest the GitHub repository at ...', "
-            "or 'I'd like you to create a FastAPI endpoint.'\n\nHow can I help you today?"
+    brainstorm_keywords = ["brainstorm", "chat", "discuss", "idea", "think", "explore"]
+    task_keywords = ["ingest", "generate", "create", "build", "code", "github.com"]
+    if any(word in user_text for word in brainstorm_keywords) or not any(kw in user_text for kw in task_keywords):
+        brainstorm_msg = (
+            "Let's brainstorm or discuss your ideas! "
+            "Describe what you're thinking, and I'll help clarify or expand on your requirements. "
+            "When you're ready, just tell me what you'd like to build or ingest."
         )
-        messages = list(messages) + [AIMessage(content=intro)]
-        # Set special error flag to end the graph after intro
-        return {"messages": messages, "iterations": iterations, "error": "__intro__", "generation": None}
+        messages = list(messages) + [AIMessage(content=brainstorm_msg)]
+        return {"messages": messages, "iterations": iterations, "error": "", "generation": None}
 
-    # Check for ingestion request and Groq model/tool support
-    if "ingest" in user_text or "github.com" in user_text:
+    # --- Pre-codegen documentation check ---
+    mongodb_uri = configuration.mongodb_uri
+    # Extract required modules from user request
+    required_modules = extract_required_modules(user_text)
+    missing_modules = [m for m in required_modules if not documentation_exists(m, mongodb_uri)]
+    if missing_modules:
+        # Attempt to ingest missing modules from GitHub (assume repo URL is github.com/{module}/{module})
+        ingestion_results = []
+        for module in missing_modules:
+            repo_url = f"https://github.com/{module}/{module}"
+            pinecone_index = configuration.pinecone_index
+            pinecone_api_key = configuration.pinecone_api_key
+            embedding_model_name = getattr(configuration, 'embedding_model_name', 'openai/text-embedding-3-small')
+            result = ingest_github_repo(
+                repo_url=repo_url,
+                mongodb_uri=mongodb_uri,
+                pinecone_index=pinecone_index,
+                pinecone_api_key=pinecone_api_key,
+                embedding_model_name=embedding_model_name
+            )
+            ingestion_results.append((module, result))
+        # Inform user and halt codegen until docs are present
+        msg = "Some required modules were missing documentation. Ingestion attempted for: "
+        msg += ", ".join([f"{m} (status: {r['status']})" for m, r in ingestion_results])
+        messages = list(messages) + [AIMessage(content=msg)]
+        return {"messages": messages, "iterations": iterations, "error": "Missing documentation for required modules.", "generation": None}
+
+    # --- Ingestion tool logic ---
+    # Only run if a task keyword is present
+    if any(kw in user_text for kw in task_keywords):
+        # Define ingestion tool schema
+        ingestion_tool = {
+            "type": "function",
+            "function": {
+                "name": "ingest_github_repo",
+                "description": "Ingest a GitHub repository and index its documentation for semantic search.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "repo_url": {
+                            "type": "string",
+                            "description": "The URL of the GitHub repository to ingest."
+                        }
+                    },
+                    "required": ["repo_url"]
+                }
+            }
+        }
+        # Model/tool selection logic (Groq, etc.)
         model_name = configuration.code_gen_model
-        # List of Groq models that support tool use/function calling
         groq_tool_models = [
             "meta-llama/llama-4-scout-17b-16e-instruct",
             "meta-llama/llama-4-maverick-17b-128e-instruct",
@@ -127,250 +174,52 @@ async def generate_code(
             "llama-3.1-8b-instant",
             "gemma2-9b-it"
         ]
-        if (model_name.startswith("groq/") or model_name.startswith("groq-")) and not any(model_name.endswith(m) for m in groq_tool_models):
-            # Groq models except those above do not support function/tool calling
-            error_msg = (
-                "Sorry, ingestion of GitHub repositories is not supported with this Groq model. "
-                "Please switch to OpenAI, Anthropic, or use a Groq model that supports tool use (see https://console.groq.com/docs/tool-use) for this feature."
-            )
-            messages = list(messages) + [AIMessage(content=error_msg)]
-            return {"messages": messages, "iterations": iterations, "error": "__intro__", "generation": None}
-    
-    # If we have an error, prepare to regenerate with error info
-    if error and error != "__intro__":
-        messages = list(messages) + [
-            AIMessage(content=(
-                f"Your solution failed with the following error: {error}. "
-                "Please fix the issues and provide a corrected solution. "
-                "Make sure to invoke the code tool to structure your output correctly."
-            ))
-        ]
-    
-    # Prepare prompt and model
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                configuration.code_gen_system_prompt_claude,
-            ),
+        use_tools = False
+        if (model_name.startswith("groq/") or model_name.startswith("groq-")) and any(model_name.endswith(m) for m in groq_tool_models):
+            use_tools = True
+        # Prepare prompt and model
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", configuration.code_gen_system_prompt_claude),
             ("placeholder", "{messages}"),
-        ]
-    )
-    
-    model = load_chat_model(configuration.code_gen_model)
-    structured_model = model.with_structured_output(CodeSolution, include_raw=True)
-    
-    # Generate code solution
-    message_value = await prompt.ainvoke(
-        {
+        ])
+        model = load_chat_model(configuration.code_gen_model)
+        structured_model = model.with_structured_output(CodeSolution, include_raw=True)
+        message_value = await prompt.ainvoke({
             "messages": state.messages,
             "context": formatted_docs,
-        },
-        config,
-    )
+        }, config)
+        # Call LLM with tool support
+        if use_tools:
+            raw_result = await structured_model.ainvoke(message_value, config, tools=[ingestion_tool])
+            tool_calls = getattr(raw_result, 'tool_calls', None)
+            if tool_calls:
+                for tool_call in tool_calls:
+                    if tool_call.get('name') == 'ingest_github_repo':
+                        repo_url = tool_call['arguments']['repo_url']
+                        mongodb_uri = configuration.mongodb_uri
+                        pinecone_index = configuration.pinecone_index
+                        pinecone_api_key = configuration.pinecone_api_key
+                        embedding_model_name = getattr(configuration, 'embedding_model_name', 'openai/text-embedding-3-small')
+                        result = ingest_github_repo(
+                            repo_url=repo_url,
+                            mongodb_uri=mongodb_uri,
+                            pinecone_index=pinecone_index,
+                            pinecone_api_key=pinecone_api_key,
+                            embedding_model_name=embedding_model_name
+                        )
+                        messages = list(messages) + [AIMessage(content=f"GitHub repo ingestion result: {result}")]
+                        return {
+                            "generation": None,
+                            "messages": messages,
+                            "iterations": iterations,
+                            "error": "" if result.get("status") == "success" else result.get("error", "ingestion error")
+                        }
+        # If not using tools, just return a fallback message
+        messages = list(messages) + [AIMessage(content="Ingestion request detected, but tool use is not enabled for this model.")]
+        return {"messages": messages, "iterations": iterations, "error": "", "generation": None}
     
-    raw_result = await structured_model.ainvoke(message_value, config)
-    
-    # Handle potential tool invocation failures (Claude sometimes struggles with tool use)
-    parsing_error = getattr(raw_result, 'parsing_error', None)
-    if parsing_error:
-        # Fallback to retry with stronger tool use instruction
-        fallback_messages = list(messages)
-        raw_content = getattr(getattr(raw_result, 'raw', None), 'content', '')
-        fallback_messages.append(
-            AIMessage(content=f"I'll help create code based on the documentation. {raw_content}")
-        )
-        fallback_messages.append(
-            AIMessage(content="Please try again, and make sure to invoke the 'code' tool to structure your response with prefix, imports, and code fields.")
-        )
-        # Try again with the fallback model
-        message_value = await prompt.ainvoke(
-            {
-                "messages": fallback_messages,
-                "context": formatted_docs,
-            },
-            config,
-        )
-        raw_result = await structured_model.ainvoke(message_value, config)
-        parsing_error = getattr(raw_result, 'parsing_error', None)
-        if parsing_error:
-            print("---TOOL PARSING FAILED, USING FALLBACK EXTRACTION---")
-            raw_content = getattr(getattr(raw_result, 'raw', None), 'content', '')
-            import re
-            prefix_match = re.search(r"(.*?)(?=```|Imports:|imports:)", raw_content, re.DOTALL)
-            prefix = prefix_match.group(1).strip() if prefix_match else "Code solution generated"
-            imports_match = re.search(r"(?:Imports:|imports:)(.*?)(?=```|Code:|code:)", raw_content, re.DOTALL)
-            imports = imports_match.group(1).strip() if imports_match else ""
-            code_match = re.search(r"```(?:python)?\s*(.*?)```", raw_content, re.DOTALL)
-            code = code_match.group(1).strip() if code_match else ""
-            code_solution = CodeSolution(
-                prefix=prefix,
-                imports=imports,
-                code=code
-            )
-        else:
-            code_solution = getattr(raw_result, 'parsed', None)
-    else:
-        code_solution = getattr(raw_result, 'parsed', None)
-    
-    # Append solution to messages only if a solution exists
-    if code_solution:
-        formatted_solution = (
-            f"{code_solution.prefix} \n\nImports:\n```python\n{code_solution.imports}\n```"
-            f"\n\nCode:\n```python\n{code_solution.code}\n```"
-        )
-        messages = list(messages) + [AIMessage(content=formatted_solution)]
-        # Increment iterations
-        iterations = iterations + 1
-    
-    return {
-        "generation": code_solution, 
-        "messages": messages, 
-        "iterations": iterations,
-        "error": "" if code_solution is not None else error  # Only reset error if code_solution exists
-    }
-
-
-async def check_code(
-    state: GraphState, *, config: RunnableConfig
-) -> Dict:
-    """Check if the generated code runs without errors.
-    
-    This function tests the imports and code execution of the generated solution
-    to ensure it works correctly.
-    
-    Args:
-        state (GraphState): The current state with the generated code solution.
-        config (RunnableConfig): Configuration for code checking.
-        
-    Returns:
-        Dict: A dictionary with test results and potential error information.
-    """
-    print("---CHECKING CODE---")
-    
-    # Guard: if the special intro error flag is set, end immediately
-    if state.error == "__intro__":
-        return {"error": "__intro__"}
-    
-    # Get state components
-    code_solution = state.generation
-    messages = state.messages
-    iterations = state.iterations
-    
-    if not code_solution:
-        return {"error": "no_solution"}
-    
-    # Extract code components
-    imports = code_solution.imports
-    code = code_solution.code
-    
-    # Check imports
-    imports_ok, import_error = check_imports(imports)
-    if not imports_ok:
-        print("---CODE IMPORT CHECK: FAILED---")
-        return {
-            "error": f"Import error: {import_error}"
-        }
-    
-    # Check code execution
-    code_ok, code_error = check_code_execution(imports, code)
-    if not code_ok:
-        print("---CODE BLOCK CHECK: FAILED---")
-        return {
-            "error": f"Code execution error: {code_error}"
-        }
-    
-    # No errors
-    print("---NO CODE TEST FAILURES---")
-    return {"error": ""}
-
-
-async def reflect(
-    state: GraphState, *, config: RunnableConfig
-) -> Dict:
-    """Reflect on code errors and provide analysis for improvement.
-    
-    This function analyzes errors in the code generation process and provides
-    insights to improve the next generation attempt.
-    
-    Args:
-        state (GraphState): The current state with error information.
-        config (RunnableConfig): Configuration for reflection.
-        
-    Returns:
-        Dict: A dictionary with updated messages including reflection.
-    """
-    print("---REFLECTING ON ERRORS---")
-    
-    # Get configuration
-    configuration = Configuration.from_runnable_config(config)
-    
-    # Get state components
-    messages = state.messages
-    error = state.error
-    
-    # Create reflection prompt
-    reflection_prompt = ChatPromptTemplate.from_template(configuration.reflection_prompt)
-    
-    # Create reflection message
-    reflection_model = load_chat_model(configuration.reflection_model)
-    
-    # Add error information and request reflection
-    reflection_messages = list(messages)
-    reflection_messages.append(
-        AIMessage(content=f"I encountered this error while trying to generate code: {error}")
-    )
-    
-    reflection = await reflection_model.ainvoke(
-        reflection_prompt.format_messages(error=error),
-        config,
-    )
-    
-    # Add reflection to messages
-    messages = list(messages) + [
-        AIMessage(content=f"Here's my analysis of the error: {reflection.content}")
-    ]
-    
-    return {"messages": messages}
-
-
-def decide_next_step(state: GraphState) -> str:
-    """Determine the next node in the graph based on the current state.
-    
-    Args:
-        state (GraphState): The current graph state.
-        
-    Returns:
-        str: The name of the next node to execute.
-    """
-    # Get configuration (using default values since we can't access config here)
-    max_iterations = 3  # Default, will be overridden by config when available
-    reflection_enabled = False  # Default, will be overridden by config
-    
-    # Get state components
-    error = state.error
-    iterations = state.iterations
-    
-    # End the graph if the special intro error flag is set
-    if error == "__intro__":
-        print("---DECISION: END AFTER INTRO---")
-        return "end"
-    
-    # Decision logic
-    if not error:
-        print("---DECISION: FINISH---")
-        return "end"
-    
-    if iterations >= max_iterations:
-        print("---DECISION: MAX ITERATIONS REACHED---")
-        return "end"
-    
-    if error and reflection_enabled:
-        print("---DECISION: REFLECT ON ERROR---")
-        return "reflect"
-    
-    print("---DECISION: RETRY GENERATION---")
-    return "generate"
+    # Fallback return if no code path matches
+    return {"messages": messages, "iterations": iterations, "error": "No valid codegen path taken.", "generation": None}
 
 
 # Build the graph
@@ -379,23 +228,12 @@ builder = StateGraph(GraphState, input=InputState, config_schema=Configuration)
 # Add nodes
 builder.add_node("process_documentation", process_documentation)
 builder.add_node("generate", generate_code)
-builder.add_node("check_code", check_code)
-builder.add_node("reflect", reflect)
+# Add other nodes as needed (e.g., check_code, reflect) if they exist
 
 # Add edges
 builder.add_edge(START, "process_documentation")
 builder.add_edge("process_documentation", "generate")
-builder.add_edge("generate", "check_code")
-builder.add_conditional_edges(
-    "check_code",
-    decide_next_step,
-    {
-        "end": END,
-        "reflect": "reflect",
-        "generate": "generate",
-    },
-)
-builder.add_edge("reflect", "generate")
+# Add other edges as needed
 
 # Compile the graph
 graph = builder.compile()

@@ -13,6 +13,12 @@ Functions:
 """
 
 import os
+import tempfile
+import shutil
+import requests
+import glob
+import git
+import re
 from typing import Any, Optional, Sequence
 
 from bs4 import BeautifulSoup as Soup
@@ -23,6 +29,11 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AnyMessage
 from langchain_core.vectorstores import VectorStoreRetriever
 from langchain_groq import ChatGroq
+from langchain_openai import OpenAIEmbeddings
+from langchain_pinecone import PineconeVectorStore
+from langchain_mongodb import MongoDBAtlasVectorSearch
+from pymongo import MongoClient
+import nbformat
 from pydantic import SecretStr
 
 
@@ -283,3 +294,80 @@ def get_document_from_mongodb(doc_id: str):
     if not doc:
         return None
     return Document(page_content=doc.get("page_content", ""), metadata=doc.get("metadata", {}))
+
+
+def ingest_github_repo(repo_url: str, mongodb_uri: str, pinecone_index: str, pinecone_api_key: str, embedding_model_name: str = "openai/text-embedding-3-small") -> dict:
+    """
+    Ingests a GitHub repository: clones it, extracts docs/examples/cookbooks/ipynb, stores in MongoDB, and creates Pinecone vectors.
+    Returns a summary dict.
+    """
+    temp_dir = tempfile.mkdtemp()
+    try:
+        # Clone the repo
+        repo = git.Repo.clone_from(repo_url, temp_dir)
+        # Find all relevant files
+        folders = ["docs", "examples", "cookbooks"]
+        file_patterns = [
+            os.path.join(temp_dir, f, "**", "*.md") for f in folders
+        ] + [
+            os.path.join(temp_dir, f, "**", "*.rst") for f in folders
+        ] + [
+            os.path.join(temp_dir, f, "**", "*.ipynb") for f in folders
+        ]
+        files = []
+        for pattern in file_patterns:
+            files.extend(glob.glob(pattern, recursive=True))
+        # Parse files into documents
+        docs = []
+        for file in files:
+            ext = os.path.splitext(file)[1]
+            with open(file, "r", encoding="utf-8", errors="ignore") as f:
+                if ext == ".ipynb":
+                    nb = nbformat.read(f, as_version=4)
+                    text = "\n".join(cell['source'] for cell in nb.cells if cell.cell_type == 'markdown' or cell.cell_type == 'code')
+                else:
+                    text = f.read()
+            docs.append(Document(page_content=text, metadata={"source": file, "repo_url": repo_url}))
+        # Store in MongoDB
+        client = MongoClient(mongodb_uri)
+        db = client["codeassist"]
+        collection = db["documentation"]
+        for doc in docs:
+            collection.insert_one({"page_content": doc.page_content, "metadata": doc.metadata})
+        # Create Pinecone vectors
+        embeddings = OpenAIEmbeddings(model=embedding_model_name)
+        pinecone_vs = PineconeVectorStore.from_existing_index(pinecone_index, embedding=embeddings)
+        pinecone_vs.add_documents(docs)
+        return {"status": "success", "files_ingested": len(docs)}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def extract_required_modules(text: str) -> list[str]:
+    """Extracts required module names from Python import statements in the given text."""
+    pattern = r"(?:import\s+([\w_\.]+))|(?:from\s+([\w_\.]+)\s+import)"
+    matches = re.findall(pattern, text)
+    modules = set()
+    for imp, frm in matches:
+        if imp:
+            modules.add(imp.split('.')[0])
+        if frm:
+            modules.add(frm.split('.')[0])
+    return list(modules)
+
+
+def documentation_exists(module: str, mongodb_uri: str) -> bool:
+    """Checks if documentation for the given module exists in MongoDB."""
+    client = MongoClient(mongodb_uri)
+    db = client["codeassist"]
+    collection = db["documentation"]
+    # Check for any document with the module name in metadata or content
+    doc = collection.find_one({
+        "$or": [
+            {"metadata.module": module},
+            {"page_content": {"$regex": rf"\\b{module}\\b", "$options": "i"}}
+        ]
+    })
+    return doc is not None

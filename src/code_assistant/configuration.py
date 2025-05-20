@@ -122,3 +122,20 @@ class Configuration(DocumentConfiguration):
             "description": "Whether to enable the reflection step for error analysis."
         },
     )
+
+    pinecone_api_key: str = field(
+        default_factory=lambda: os.getenv("PINECONE_API_KEY", ""),
+        metadata={"description": "API key for Pinecone vector database."},
+    )
+    pinecone_index: str = field(
+        default_factory=lambda: os.getenv("PINECONE_INDEX_NAME", "codeassistant"),
+        metadata={"description": "Pinecone index name for vector storage."},
+    )
+    mongodb_uri: str = field(
+        default_factory=lambda: os.getenv("MONGODB_URI", ""),
+        metadata={"description": "MongoDB URI for document storage."},
+    )
+    embedding_model_name: str = field(
+        default_factory=lambda: os.getenv("EMBEDDING_MODEL_NAME", "openai/text-embedding-3-small"),
+        metadata={"description": "Embedding model name for vectorization."},
+    )
