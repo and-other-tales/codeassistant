@@ -131,7 +131,7 @@ def load_chat_model(fully_specified_name: str) -> BaseChatModel:
         api_key = os.getenv("GROQ_API_KEY")
         if not api_key:
             raise ValueError("GROQ_API_KEY environment variable must be set for Groq models.")
-        return ChatGroq(model=model, api_key=SecretStr(api_key))
+        return ChatGroq(groq_api_key=SecretStr(api_key), model_name=model)
     elif provider == "openai":
         return init_chat_model(model, model_provider="openai")
     elif provider == "anthropic":
@@ -261,7 +261,7 @@ def make_mongodb_retriever(
     
     Args:
         user_id (str): User ID for filtering results.
-        embedding_model (Embeddings): The embedding model to use.
+        embedding_model: Embeddings: The embedding model to use.
         search_kwargs (dict[str, Any], optional): Additional search parameters.
         
     Returns:
@@ -313,6 +313,8 @@ def ingest_github_repo(repo_url: str, mongodb_uri: str, pinecone_index: str, pin
             os.path.join(temp_dir, f, "**", "*.rst") for f in folders
         ] + [
             os.path.join(temp_dir, f, "**", "*.ipynb") for f in folders
+        ] + [
+            os.path.join(temp_dir, f, "**", "*.py") for f in folders
         ]
         files = []
         for pattern in file_patterns:
@@ -335,14 +337,28 @@ def ingest_github_repo(repo_url: str, mongodb_uri: str, pinecone_index: str, pin
         for doc in docs:
             collection.insert_one({"page_content": doc.page_content, "metadata": doc.metadata})
         # Create Pinecone vectors
-        embeddings = OpenAIEmbeddings(model=embedding_model_name)
-        pinecone_vs = PineconeVectorStore.from_existing_index(pinecone_index, embedding=embeddings)
-        pinecone_vs.add_documents(docs)
+        if docs:
+            embeddings = OpenAIEmbeddings(model=embedding_model_name)
+            pinecone_vs = PineconeVectorStore.from_existing_index(pinecone_index, embedding=embeddings)
+            pinecone_vs.add_documents(docs)
         return {"status": "success", "files_ingested": len(docs)}
     except Exception as e:
         return {"status": "error", "error": str(e)}
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def ingest_repository(repo_url: str, mongodb_uri: str, pinecone_index: str, pinecone_api_key: str, embedding_model_name: str = "openai/text-embedding-3-small") -> dict:
+    """
+    Ingest any GitHub repository: clones, extracts docs/examples/cookbooks/notebooks, stores in MongoDB, and creates Pinecone vectors.
+    """
+    return ingest_github_repo(
+        repo_url=repo_url,
+        mongodb_uri=mongodb_uri,
+        pinecone_index=pinecone_index,
+        pinecone_api_key=pinecone_api_key,
+        embedding_model_name=embedding_model_name
+    )
 
 
 def extract_required_modules(text: str) -> list[str]:
@@ -396,6 +412,56 @@ def fetch_and_ingest_langchain_repos(mongodb_uri: str, pinecone_index: str, pine
         )
         results[repo_url] = result
     return results
+
+
+def generate_code_with_doc_check(
+    code_task: str,
+    mongodb_uri: str,
+    pinecone_index: str,
+    pinecone_api_key: str,
+    embedding_model_name: str = "openai/text-embedding-3-small",
+    repo_url_map: Optional[dict] = None,
+    code_generator=None,
+    code_tester=None
+) -> str:
+    """
+    Orchestrates code generation with documentation check and ingestion:
+    - Extracts required modules from the code task.
+    - For each module, checks if documentation exists in MongoDB.
+    - If not, ingests the relevant repo (blocking until done).
+    - Only proceeds with code generation when all docs are present.
+    - Tests all generated code.
+    - Returns the generated code.
+    repo_url_map: Optional dict mapping module names to repo URLs.
+    code_generator: Callable that takes code_task and returns code (default: NotImplementedError).
+    code_tester: Callable that takes code and returns test result (default: NotImplementedError).
+    """
+    if repo_url_map is None:
+        repo_url_map = {}
+    # Extract required modules
+    required_modules = extract_required_modules(code_task)
+    # For each module, ensure docs are present
+    for module in required_modules:
+        if not documentation_exists(module, mongodb_uri):
+            repo_url = repo_url_map.get(module, f"https://github.com/langchain-ai/{module}")
+            ingest_repository(
+                repo_url=repo_url,
+                mongodb_uri=mongodb_uri,
+                pinecone_index=pinecone_index,
+                pinecone_api_key=pinecone_api_key,
+                embedding_model_name=embedding_model_name
+            )
+    # Generate code
+    if code_generator is None:
+        raise NotImplementedError("You must provide a code_generator callable.")
+    code = code_generator(code_task)
+    # Test code
+    if code_tester is None:
+        raise NotImplementedError("You must provide a code_tester callable.")
+    test_result = code_tester(code)
+    if not test_result:
+        raise RuntimeError("Generated code did not pass tests.")
+    return code
 
 
 # --- SANDBOXED CODE EXECUTION ---
