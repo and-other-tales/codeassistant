@@ -131,7 +131,7 @@ def load_chat_model(fully_specified_name: str) -> BaseChatModel:
         api_key = os.getenv("GROQ_API_KEY")
         if not api_key:
             raise ValueError("GROQ_API_KEY environment variable must be set for Groq models.")
-        return ChatGroq(groq_api_key=SecretStr(api_key), model_name=model)
+        return ChatGroq(model=model, api_key=SecretStr(api_key))
     elif provider == "openai":
         return init_chat_model(model, model_provider="openai")
     elif provider == "anthropic":
@@ -389,20 +389,20 @@ def documentation_exists(module: str, mongodb_uri: str) -> bool:
     return doc is not None
 
 
-def fetch_and_ingest_langchain_repos(mongodb_uri: str, pinecone_index: str, pinecone_api_key: str, embedding_model_name: str = "openai/text-embedding-3-small") -> dict:
+def fetch_and_ingest_repos(
+    repo_urls: list[str],
+    mongodb_uri: str,
+    pinecone_index: str,
+    pinecone_api_key: str,
+    embedding_model_name: str = "openai/text-embedding-3-small"
+) -> dict:
     """
-    Fetches and ingests documentation and examples from:
-    - https://github.com/langchain-ai/langchain-sandbox
-    - https://github.com/langchain-ai/langgraph-codeact
-    Returns a dict with ingestion results for both repos.
+    Ingest documentation and examples from a list of GitHub repository URLs.
+    Returns a dict with ingestion results for each repo.
     """
     from code_assistant.utils import ingest_github_repo
-    repos = [
-        "https://github.com/langchain-ai/langchain-sandbox",
-        "https://github.com/langchain-ai/langgraph-codeact"
-    ]
     results = {}
-    for repo_url in repos:
+    for repo_url in repo_urls:
         result = ingest_github_repo(
             repo_url=repo_url,
             mongodb_uri=mongodb_uri,
@@ -432,18 +432,18 @@ def generate_code_with_doc_check(
     - Only proceeds with code generation when all docs are present.
     - Tests all generated code.
     - Returns the generated code.
-    repo_url_map: Optional dict mapping module names to repo URLs.
+    repo_url_map: Dict mapping module names to repo URLs. Must be provided for missing modules.
     code_generator: Callable that takes code_task and returns code (default: NotImplementedError).
     code_tester: Callable that takes code and returns test result (default: NotImplementedError).
     """
     if repo_url_map is None:
         repo_url_map = {}
-    # Extract required modules
     required_modules = extract_required_modules(code_task)
-    # For each module, ensure docs are present
     for module in required_modules:
         if not documentation_exists(module, mongodb_uri):
-            repo_url = repo_url_map.get(module, f"https://github.com/langchain-ai/{module}")
+            repo_url = repo_url_map.get(module)
+            if not repo_url:
+                raise ValueError(f"No repository URL provided for missing module: {module}. Please specify in repo_url_map.")
             ingest_repository(
                 repo_url=repo_url,
                 mongodb_uri=mongodb_uri,
@@ -451,11 +451,9 @@ def generate_code_with_doc_check(
                 pinecone_api_key=pinecone_api_key,
                 embedding_model_name=embedding_model_name
             )
-    # Generate code
     if code_generator is None:
         raise NotImplementedError("You must provide a code_generator callable.")
     code = code_generator(code_task)
-    # Test code
     if code_tester is None:
         raise NotImplementedError("You must provide a code_tester callable.")
     test_result = code_tester(code)
