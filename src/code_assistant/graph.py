@@ -10,20 +10,22 @@ from langgraph.graph import END, StateGraph, START
 
 from code_assistant.configuration import Configuration
 from code_assistant.state import CodeSolution, GraphState, InputState
-from code_assistant.utils import (
+from code_assistant.tools import (
     extract_tool_calls,
     format_tool_call,
+    extract_required_modules,
+    documentation_exists,
+    get_github_tools,
+    build_agent_tools,
+    check_and_ingest_missing_modules
+)
+from code_assistant.utils import (
     check_code_execution,
     check_imports,
     format_docs, 
     get_message_text,
     load_chat_model,
-    extract_required_modules,
-    documentation_exists,
-    ingest_github_repo,
-    get_github_tools,
-    build_agent_tools,
-    check_and_ingest_missing_modules
+    ingest_github_repo
 )
 
 
@@ -82,13 +84,16 @@ async def generate_code(
                 formatted_call = format_tool_call(tool_call)
                 if formatted_call['name'] == 'IngestGithubRepo':
                     args = formatted_call['arguments']
-                    result = ingest_github_repo(
+                    result = await ingest_github_repo(
                         repo_url=args['repo_url'],
                         mongodb_uri=configuration.mongodb_uri,
                         pinecone_index=configuration.pinecone_index,
-                        pinecone_api_key=configuration.pinecone_api_key
+                        pinecone_api_key=configuration.pinecone_api_key,
+                        embedding_model_name=configuration.embedding_model_name
                     )
-                    messages.append(AIMessage(content=f"GitHub repo ingestion complete: {result['status']}"))
+                    # Handle the result which may be a boolean or a dictionary
+                    status_message = "successful" if result == True or (isinstance(result, dict) and result.get('status') == 'success') else "failed"
+                    messages.append(AIMessage(content=f"GitHub repo ingestion complete: {status_message}"))
                     return {
                         "messages": messages,
                         "iterations": iterations,
@@ -103,20 +108,26 @@ async def generate_code(
                 "error": str(e),
                 "generation": None
             }
-    
-    # For code generation requests, check required knowledge
+      # For code generation requests, check required knowledge and modules
     required_modules = extract_required_modules(user_text)
     if required_modules:
+        # Log the detected modules for debugging
+        print(f"Detected modules: {required_modules}")
+        
         # Validate documentation exists for all required modules
         missing_modules = [m for m in required_modules if not documentation_exists(m, configuration.mongodb_uri)]
         if missing_modules:
-            # Attempt to ingest missing modules
+            # Log the missing modules
+            print(f"Missing modules that need ingestion: {missing_modules}")
+            
+            # Attempt to ingest missing modules automatically
             ingestion_results = await check_and_ingest_missing_modules(
                 required_modules=missing_modules,
                 mongodb_uri=configuration.mongodb_uri,
                 pinecone_config={
                     'index': configuration.pinecone_index,
-                    'api_key': configuration.pinecone_api_key
+                    'api_key': configuration.pinecone_api_key,
+                    'embedding_model': configuration.embedding_model_name
                 }
             )
             
@@ -167,13 +178,16 @@ async def generate_code(
             if formatted_call['name'] == 'IngestGithubRepo':
                 # Handle additional ingestion requests
                 args = formatted_call['arguments']
-                ingestion_result = ingest_github_repo(
+                ingestion_result = await ingest_github_repo(
                     repo_url=args['repo_url'],
                     mongodb_uri=configuration.mongodb_uri,
                     pinecone_index=configuration.pinecone_index,
-                    pinecone_api_key=configuration.pinecone_api_key
+                    pinecone_api_key=configuration.pinecone_api_key,
+                    embedding_model_name=configuration.embedding_model_name
                 )
-                messages.append(AIMessage(content=f"Additional repo ingestion result: {ingestion_result['status']}"))
+                # Handle the result which may be a boolean or a dictionary
+                status_message = "successful" if ingestion_result == True or (isinstance(ingestion_result, dict) and ingestion_result.get('status') == 'success') else "failed"
+                messages.append(AIMessage(content=f"Additional repo ingestion result: {status_message}"))
         
         # Return the final result
         return {

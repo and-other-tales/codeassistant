@@ -1,5 +1,6 @@
-import pytest
-from code_assistant.utils import extract_required_modules, documentation_exists, check_imports, check_code_execution
+import unittest
+from code_assistant.tools import extract_required_modules, documentation_exists
+from code_assistant.utils import check_imports, check_code_execution
 
 def test_extract_required_modules():
     code = """

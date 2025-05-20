@@ -12,11 +12,6 @@ various vector stores for document retrieval (Pinecone, MongoDB).
 
 from code_assistant.configuration import Configuration, DocumentConfiguration
 from code_assistant.state import CodeSolution, GraphState, InputState
-# Import graph at the end to avoid circular import issues
-try:
-    from code_assistant.graph import graph
-except ImportError:
-    graph = None  # or handle/log as needed
 
 __all__ = [
     "Configuration",
@@ -25,8 +20,10 @@ __all__ = [
     "GraphState",
     "InputState",
 ]
+
 # Import graph at the end to avoid circular import issues
 try:
     from code_assistant.graph import graph
+    __all__.append("graph")
 except ImportError:
     graph = None  # or handle/log as needed

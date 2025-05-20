@@ -1,0 +1,20 @@
+{
+  "servers": {
+    "langchain Docs": {
+      "type": "sse",
+      "url": "https://gitmcp.io/langchain-ai/langchain"
+    },
+    "langgraph Docs": {
+      "type": "sse",
+      "url": "https://gitmcp.io/langchain-ai/langgraph"
+    },
+    "huggingface Datasets Docs": {
+      "type": "sse",
+      "url": "https://gitmcp.io/huggingface/datasets"
+    },
+    "huggingface Transformers Docs": {
+      "type": "sse",
+      "url": "https://gitmcp.io/huggingface/transformers"
+    },
+  }
+}

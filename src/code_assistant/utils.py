@@ -5,11 +5,16 @@ code testing, and other common operations in the code assistant project.
 
 Functions:
     get_message_text: Extract text content from various message formats.
-    format_docs: Convert documents to an xml-formatted string.
+    format_docs: Convert documents to an XML format.
     load_chat_model: Load a chat model by provider/model name.
     check_imports: Test if imports in generated code are valid.
     check_code_execution: Test if generated code executes without errors.
-    extract_documentation: Extract documentation from messages or documents.
+    extract_documentation_from_url: Extract documentation from a URL.
+    make_text_encoder: Create a text encoder for embeddings.
+    make_pinecone_retriever: Create a Pinecone vector store retriever.
+    make_mongodb_retriever: Create a MongoDB Atlas vector store retriever.
+    get_document_from_mongodb: Retrieve a document from MongoDB.
+    ingest_github_repo: Ingest a GitHub repository into the document storage.
 """
 
 import os
@@ -20,7 +25,10 @@ import glob
 import git
 import re
 import subprocess
-from typing import Any, Optional, Sequence, List, Dict, Union
+import json
+import asyncio
+import logging
+from typing import Any, Optional, Sequence, List, Dict, Union, Iterable, Tuple
 
 from bs4 import BeautifulSoup as Soup
 from langchain.chat_models import init_chat_model
@@ -37,6 +45,7 @@ from pymongo import MongoClient
 import nbformat
 from pydantic import SecretStr
 
+logger = logging.getLogger(__name__)
 
 __all__ = [
     'get_message_text',
@@ -49,16 +58,7 @@ __all__ = [
     'make_pinecone_retriever',
     'make_mongodb_retriever',
     'get_document_from_mongodb',
-    'ingest_github_repo',
-    'ingest_repository',
-    'fetch_and_ingest_repos',
-    'extract_required_modules',
-    'documentation_exists',
-    'get_github_tools',
-    'build_agent_tools',
-    'extract_tool_calls',
-    'format_tool_call',
-    'check_and_ingest_missing_modules'
+    'ingest_github_repo'
 ]
 
 
@@ -144,7 +144,20 @@ def format_docs(docs: Optional[Sequence[Document]]) -> str:
 
 
 def load_chat_model(fully_specified_name: str) -> BaseChatModel:
-    """Load a chat model from a fully specified name, including Groq support."""
+    """Load a chat model from a fully specified name, including Groq support.
+    
+    This function loads a chat model based on a fully qualified name in the format
+    provider/model, such as 'openai/gpt-4', 'anthropic/claude-3-opus', or 'groq/llama3-8b-8192'.
+    
+    Args:
+        fully_specified_name (str): The fully qualified model name in provider/model format.
+        
+    Returns:
+        BaseChatModel: An initialized chat model ready to use.
+        
+    Raises:
+        ValueError: If the model provider is not supported or if required API keys are missing.
+    """
     try:
         if "/" in fully_specified_name:
             provider, model = fully_specified_name.split("/", maxsplit=1)
@@ -152,15 +165,19 @@ def load_chat_model(fully_specified_name: str) -> BaseChatModel:
             provider = ""
             model = fully_specified_name
 
-        if provider == "groq":
-            # Support for ChatGroq
+        if provider.lower() == "groq":
+            # Enhanced support for ChatGroq with proper tool-calling support
+            from code_assistant.groq_tools import ChatGroq
             api_key = os.getenv("GROQ_API_KEY")
             if not api_key:
                 raise ValueError("GROQ_API_KEY environment variable must be set for Groq models.")
-            return ChatGroq(model=model, api_key=SecretStr(api_key))
-        elif provider == "openai":
+            
+            from pydantic.v1 import SecretStr
+            secret_key = SecretStr(api_key)
+            return ChatGroq(model=model, api_key=secret_key)
+        elif provider.lower() == "openai":
             return init_chat_model(model, model_provider="openai")
-        elif provider == "anthropic":
+        elif provider.lower() == "anthropic":
             return init_chat_model(model, model_provider="anthropic")
         else:
             # If provider is not recognized, try passing the full name (for future compatibility)
@@ -325,394 +342,115 @@ def get_document_from_mongodb(doc_id: str):
     return Document(page_content=doc.get("page_content", ""), metadata=doc.get("metadata", {}))
 
 
-def ingest_github_repo(repo_url: str, mongodb_uri: str, pinecone_index: str, pinecone_api_key: str, embedding_model_name: str = "openai/text-embedding-3-small") -> dict:
-    """
-    Ingests a GitHub repository: clones it, extracts docs/examples/cookbooks/ipynb, stores in MongoDB, and creates Pinecone vectors.
-    Returns a summary dict.
-    """
-    import subprocess
-    temp_dir = tempfile.mkdtemp()
-    try:
-        # Set git config for large repos
-        subprocess.run(["git", "config", "--global", "http.postBuffer", "157286400"], check=True)
-        # Clone the repo
-        subprocess.run(["git", "clone", repo_url, temp_dir"], check=True)
-        # Find all relevant files
-        folders = ["docs", "examples", "cookbooks"]
-        file_patterns = []
-        for f in folders:
-            file_patterns.extend([
-                os.path.join(temp_dir, f, "**", "*.md"),
-                os.path.join(temp_dir, f, "**", "*.rst"),
-                os.path.join(temp_dir, f, "**", "*.ipynb"),
-                os.path.join(temp_dir, f, "**", "*.py"),
-            ])
-        files = []
-        for pattern in file_patterns:
-            files.extend(glob.glob(pattern, recursive=True))
-        # Parse files into documents
-        docs = []
-        for file in files:
-            ext = os.path.splitext(file)[1]
-            with open(file, "r", encoding="utf-8", errors="ignore") as f:
-                if ext == ".ipynb":
-                    nb = nbformat.read(f, as_version=4)
-                    text = "\n".join(cell['source'] for cell in nb.cells if cell.cell_type == 'markdown' or cell.cell_type == 'code')
-                else:
-                    text = f.read()
-            docs.append(Document(page_content=text, metadata={"source": file, "repo_url": repo_url}))
-        # Store in MongoDB
-        client = MongoClient(mongodb_uri)
-        db = client["codeassist"]
-        collection = db["documentation"]
-        for doc in docs:
-            collection.insert_one({"page_content": doc.page_content, "metadata": doc.metadata})
-        # Create Pinecone vectors
-        if docs:
-            embeddings = OpenAIEmbeddings(model=embedding_model_name)
-            pinecone_vs = PineconeVectorStore.from_existing_index(pinecone_index, embedding=embeddings)
-            pinecone_vs.add_documents(docs)
-        return {"status": "success", "files_ingested": len(docs)}
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
-
-def ingest_repository(repo_url: str, mongodb_uri: str, pinecone_index: str, pinecone_api_key: str, embedding_model_name: str = "openai/text-embedding-3-small") -> dict:
-    """
-    Ingest any GitHub repository: clones, extracts docs/examples/cookbooks/notebooks, stores in MongoDB, and creates Pinecone vectors.
-    """
-    return ingest_github_repo(
-        repo_url=repo_url,
-        mongodb_uri=mongodb_uri,
-        pinecone_index=pinecone_index,
-        pinecone_api_key=pinecone_api_key,
-        embedding_model_name=embedding_model_name
-    )
-
-
-def extract_required_modules(text: str) -> list[str]:
-    """Extracts required module names from Python import statements in the given text."""
-    pattern = r"(?:import\s+([\w_\.]+))|(?:from\s+([\w_\.]+)\s+import)"
-    matches = re.findall(pattern, text)
-    modules = set()
-    for imp, frm in matches:
-        if imp:
-            modules.add(imp.split('.')[0])
-        if frm:
-            modules.add(frm.split('.')[0])
-    return list(modules)
-
-
-def get_github_repo_url(module: str) -> str:
-    """
-    Convert a module name to a likely GitHub repository URL.
-    For example: 'langchain' -> 'https://github.com/langchain-ai/langchain'
-    """
-    # Map of known module to repo mappings
-    MODULE_REPO_MAP = {
-        'langchain': 'langchain-ai/langchain',
-        'langgraph': 'langchain-ai/langgraph',
-        'chromadb': 'chroma-core/chroma',
-        'pytorch': 'pytorch/pytorch',
-        'tensorflow': 'tensorflow/tensorflow',
-        'numpy': 'numpy/numpy',
-        'pandas': 'pandas-dev/pandas',
-        # Add more mappings as needed
-    }
-    
-    org_repo = MODULE_REPO_MAP.get(module, f"{module}/{module}")
-    return f"https://github.com/{org_repo}"
-
-
-def documentation_exists(module: str, mongodb_uri: str) -> bool:
-    """Checks if documentation for the given module exists in MongoDB."""
-    try:
-        client = MongoClient(mongodb_uri)
-        db = client["codeassist"]
-        collection = db["documentation"]
-        # Check for any document with the module name in metadata or content
-        doc = collection.find_one({
-            "$or": [
-                {"metadata.module": module},
-                {"page_content": {"$regex": rf"\b{module}\b", "$options": "i"}}
-            ]
-        })
-        return doc is not None
-    except Exception as e:
-        print(f"Error checking documentation existence: {e}")
-        return False
-
-
-async def check_and_ingest_missing_modules(required_modules: list[str], mongodb_uri: str, pinecone_config: dict) -> dict:
-    """
-    Check for required module documentation and ingest from GitHub if missing.
-    Returns a dict with ingestion results for each missing module.
-    """
-    missing_modules = []
-    results = {}
-    
-    # Check which modules need ingestion
-    for module in required_modules:
-        if not documentation_exists(module, mongodb_uri):
-            missing_modules.append(module)
-    
-    # Ingest missing modules
-    if missing_modules:
-        for module in missing_modules:
-            repo_url = get_github_repo_url(module)
-            try:
-                result = ingest_github_repo(
-                    repo_url=repo_url,
-                    mongodb_uri=mongodb_uri,
-                    pinecone_index=pinecone_config['index'],
-                    pinecone_api_key=pinecone_config['api_key'],
-                    embedding_model_name=pinecone_config.get('embedding_model', 'openai/text-embedding-3-small')
-                )
-                results[module] = result
-            except Exception as e:
-                results[module] = {"status": "error", "error": str(e)}
-    
-    return results
-
-
-def fetch_and_ingest_repos(
-    repo_urls: list[str],
+async def ingest_github_repo(
+    repo_url: str,
     mongodb_uri: str,
     pinecone_index: str,
     pinecone_api_key: str,
-    embedding_model_name: str = "openai/text-embedding-3-small"
-) -> dict:
-    """
-    Ingest documentation and examples from a list of GitHub repository URLs.
-    Returns a dict with ingestion results for each repo.
-    """
-    from code_assistant.utils import ingest_github_repo
-    results = {}
-    for repo_url in repo_urls:
-        result = ingest_github_repo(
-            repo_url=repo_url,
-            mongodb_uri=mongodb_uri,
-            pinecone_index=pinecone_index,
-            pinecone_api_key=pinecone_api_key,
-            embedding_model_name=embedding_model_name
-        )
-        results[repo_url] = result
-    return results
-
-
-def generate_code_with_doc_check(
-    code_task: str,
-    mongodb_uri: str,
-    pinecone_index: str,
-    pinecone_api_key: str,
-    embedding_model_name: str = "openai/text-embedding-3-small",
-    repo_url_map: Optional[dict] = None,
-    code_generator=None,
-    code_tester=None
-) -> str:
-    """
-    Orchestrates code generation with documentation check and ingestion:
-    - Extracts required modules from the code task.
-    - For each module, checks if documentation exists in MongoDB.
-    - If not, ingests the relevant repo (blocking until done).
-    - Only proceeds with code generation when all docs are present.
-    - Tests all generated code.
-    - Returns the generated code.
-    repo_url_map: Dict mapping module names to repo URLs. Must be provided for missing modules.
-    code_generator: Callable that takes code_task and returns code (default: NotImplementedError).
-    code_tester: Callable that takes code and returns test result (default: NotImplementedError).
-    """
-    if repo_url_map is None:
-        repo_url_map = {}
-    required_modules = extract_required_modules(code_task)
-    for module in required_modules:
-        if not documentation_exists(module, mongodb_uri):
-            repo_url = repo_url_map.get(module)
-            if not repo_url:
-                raise ValueError(f"No repository URL provided for missing module: {module}. Please specify in repo_url_map.")
-            ingest_repository(
-                repo_url=repo_url,
-                mongodb_uri=mongodb_uri,
-                pinecone_index=pinecone_index,
-                pinecone_api_key=pinecone_api_key,
-                embedding_model_name=embedding_model_name
-            )
-    if code_generator is None:
-        raise NotImplementedError("You must provide a code_generator callable.")
-    code = code_generator(code_task)
-    if code_tester is None:
-        raise NotImplementedError("You must provide a code_tester callable.")
-    test_result = code_tester(code)
-    if not test_result:
-        raise RuntimeError("Generated code did not pass tests.")
-    return code
-
-
-# --- SANDBOXED CODE EXECUTION ---
-
-def run_code_in_pyodide_sandbox(code: str, allow_net: bool = False):
-    """
-    Executes code in a PyodideSandbox (langchain-sandbox) for secure, isolated execution.
-    Returns the CodeExecutionResult object.
-
-    NOTE: langchain-sandbox requires langgraph<0.4.0, which may conflict with your main project.
-    If ImportError occurs, run this in a separate virtual environment or subprocess.
+    embedding_model_name: str
+) -> bool:
+    """Ingest a GitHub repository into the document storage.
+    
+    Args:
+        repo_url: URL of the GitHub repository to ingest
+        mongodb_uri: MongoDB connection URI
+        pinecone_index: Name of the Pinecone index to use
+        pinecone_api_key: Pinecone API key
+        embedding_model_name: Name of the embedding model to use
+        
+    Returns:
+        bool: True if ingestion was successful, False otherwise
     """
     try:
-        from langchain_sandbox import PyodideSandbox
-        import asyncio
-        import tempfile
-        import shutil
-    except ImportError as e:
-        raise ImportError("langchain-sandbox is not installed or incompatible with current langgraph version. "
-                          "Use a separate environment for sandboxed execution.\n" + str(e))
-    sessions_dir = tempfile.mkdtemp()
-    try:
-        sandbox = PyodideSandbox(sessions_dir=sessions_dir, allow_net=allow_net)
-        async def _run():
-            return await sandbox.execute(code)
-        return asyncio.run(_run())
-    finally:
-        shutil.rmtree(sessions_dir, ignore_errors=True)
-
-
-# --- CODEACT AGENT INTEGRATION ---
-
-def create_codeact_agent(model, tools, allow_net: bool = False):
-    """
-    Creates a CodeAct agent using PyodideSandbox for secure code execution.
-
-    NOTE: langgraph-codeact requires langgraph<0.4.0, which may conflict with your main project.
-    If ImportError occurs, run this in a separate virtual environment or subprocess.
-    """
-    try:
-        from langgraph_codeact import create_codeact
-        # Use persistent checkpointer if available
-        mongodb_uri = os.environ.get("MONGODB_URI")
-        checkpointer = get_persistent_checkpointer(mongodb_uri)
-    except ImportError as e:
-        raise ImportError("langgraph-codeact is not installed or incompatible with current langgraph version. "
-                          "Use a separate environment for codeact agent execution.\n" + str(e))
-    def pyodide_sandbox_eval(code: str, _locals: dict):
-        result = run_code_in_pyodide_sandbox(code, allow_net=allow_net)
-        return result.stdout or result.result, _locals
-    code_act = create_codeact(model, tools, pyodide_sandbox_eval)
-    agent = code_act.compile(checkpointer=checkpointer)
-    return agent
-
-
-# --- EXAMPLE TEST TEMPLATE ---
-
-def test_generated_code_with_codeact(model, tools, code: str, expected_output: str):
-    """
-    Test generated code using CodeAct agent and PyodideSandbox for correctness and safety.
-    This function will raise ImportError if dependencies are not compatible.
-    """
-    agent = create_codeact_agent(model, tools)
-    messages = [{"role": "user", "content": code}]
-    result = agent.invoke({"messages": messages})
-    # result is typically a list of message dicts; check all for expected output
-    found = any(expected_output in (msg.get("content", "") or str(msg)) for msg in (result if isinstance(result, list) else [result]))
-    assert found, f"Expected output not found. Got: {result}"
-
-
-def get_github_tools(user_consent: bool = False):
-    """
-    Conditionally load GitHubToolkit tools if the user has provided GitHub credentials and consented.
-    Returns a list of GitHub tools, or an empty list if not enabled.
-    """
-    if not user_consent:
-        return []
-    required_env = ["GITHUB_APP_ID", "GITHUB_APP_PRIVATE_KEY", "GITHUB_REPOSITORY"]
-    if not all(os.getenv(var) for var in required_env):
-        return []
-    try:
-        from langchain_community.agent_toolkits.github.toolkit import GitHubToolkit
-        from langchain_community.utilities.github import GitHubAPIWrapper
-        github = GitHubAPIWrapper()
-        toolkit = GitHubToolkit.from_github_api_wrapper(github)
-        return toolkit.get_tools()
-    except ImportError:
-        return []
-
-
-def is_tool_use_supported(model_name: str) -> bool:
-    """
-    Returns True if the model supports tool use (function calling), e.g. ChatGroq Llama4, OpenAI GPT-4o, etc.
-    Update this as new models are supported.
-    """
-    # Groq Llama-3/4, OpenAI GPT-4o, etc. (update as needed)
-    model_name = model_name.lower()
-    return any(
-        kw in model_name for kw in ["llama-4", "llama-3", "gpt-4o", "gpt-4-turbo", "tool-use"]
-    )
-
-
-def build_agent_tools(user_tools: list, github_tools: list | None = None, ingestion_tools: list | None = None) -> list:
-    """
-    Build the list of tools to pass to the agent, including user, github, and ingestion tools.
-    """
-    tools = list(user_tools) if user_tools else []
-    if github_tools:
-        tools.extend(github_tools)
-    if ingestion_tools:
-        tools.extend(ingestion_tools)
-    return tools
-
-
-# --- PERSISTENT LANGGRAPH CHECKPOINTER (MongoDB) ---
-
-from langgraph.checkpoint.base import BaseCheckpointSaver
-
-class MongoDBCheckpointer(BaseCheckpointSaver):
-    """
-    MongoDB-based checkpointer for LangGraph. Stores checkpoints in a MongoDB collection.
-    Implements the BaseCheckpointSaver interface.
-    """
-    def __init__(self, uri: str, db_name: str = "langgraph", collection: str = "checkpoints"):
+        logger.info(f"Ingesting GitHub repository: {repo_url}")
+        
+        # Import necessary modules
+        from langchain_community.document_loaders import GitLoader
+        from langchain_text_splitters import RecursiveCharacterTextSplitter
+        from langchain_mongodb import MongoDBAtlasVectorSearch
         from pymongo import MongoClient
-        self.client = MongoClient(uri)
-        self.collection = self.client[db_name][collection]
-
-    def put(self, config, checkpoint, *, metadata=None, new_versions=None):
-        # config is expected to be a dict with a unique key (e.g., 'config["key"]')
-        key = str(config.get("key", str(config)))
-        self.collection.replace_one({"_id": key}, {"_id": key, "checkpoint": checkpoint, "metadata": metadata, "new_versions": new_versions}, upsert=True)
-
-    def get(self, config):
-        key = str(config.get("key", str(config)))
-        doc = self.collection.find_one({"_id": key})
-        return doc["checkpoint"] if doc else None
-
-    def delete(self, config):
-        key = str(config.get("key", str(config)))
-        self.collection.delete_one({"_id": key})
-
-
-# Utility to select checkpointer
-
-def get_persistent_checkpointer(mongodb_uri: str | None = None):
-    """Return a persistent checkpointer (MongoDB) if URI is provided, else fallback to MemorySaver."""
-    if mongodb_uri:
-        return MongoDBCheckpointer(mongodb_uri)
-    from langgraph.checkpoint.memory import MemorySaver
-    return MemorySaver()
-
-
-# --- MODEL TOOLS UTILITY FUNCTIONS ---
-
-def extract_tool_calls(model_output: BaseMessage) -> List[Dict]:
-    """Extract tool calls from a model's output message."""
-    tool_calls = []
-    if hasattr(model_output, 'additional_kwargs'):
-        tool_calls = model_output.additional_kwargs.get('tool_calls', [])
-    return tool_calls
-
-def format_tool_call(tool_call: Dict) -> Dict:
-    """Format a tool call into a standardized structure."""
-    return {
-        'name': tool_call.get('function', {}).get('name', tool_call.get('name', '')),
-        'arguments': tool_call.get('function', {}).get('arguments', tool_call.get('arguments', {}))
-    }
+        from langchain_community.embeddings import HuggingFaceEmbeddings
+        import tempfile
+        
+        # Extract repo owner and name from URL
+        repo_parts = repo_url.strip('/').split('/')
+        if len(repo_parts) < 5 or repo_parts[2] != 'github.com':
+            logger.error(f"Invalid GitHub repository URL: {repo_url}")
+            return False
+            
+        repo_owner = repo_parts[3]
+        repo_name = repo_parts[4]
+        
+        # Create a temporary directory for cloning the repo
+        with tempfile.TemporaryDirectory() as temp_dir:
+            try:
+                # Clone the repository using GitLoader
+                loader = GitLoader(
+                    clone_url=repo_url,
+                    repo_path=temp_dir,
+                    branch="main"
+                )
+                
+                # Load and split documents
+                documents = loader.load()
+                
+                # Add metadata to documents
+                for doc in documents:
+                    metadata = doc.metadata or {}
+                    metadata.update({
+                        "source": "github",
+                        "repo_owner": repo_owner,
+                        "repo_name": repo_name,
+                        "module": repo_name
+                    })
+                    doc.metadata = metadata
+                
+                # Split documents into chunks
+                text_splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=1000,
+                    chunk_overlap=200
+                )
+                chunks = text_splitter.split_documents(documents)
+                
+                # Initialize MongoDB client
+                client = MongoClient(mongodb_uri)
+                db = client.get_default_database()
+                collection = db.documents
+                
+                # Check if documents from this repo already exist
+                existing = collection.count_documents({
+                    "metadata.repo_owner": repo_owner,
+                    "metadata.repo_name": repo_name
+                })
+                
+                if existing > 0:
+                    logger.info(f"Repository {repo_owner}/{repo_name} already exists in MongoDB")
+                    # Optionally, delete existing documents before re-ingesting
+                    collection.delete_many({
+                        "metadata.repo_owner": repo_owner,
+                        "metadata.repo_name": repo_name
+                    })
+                
+                # Initialize embeddings
+                embeddings = HuggingFaceEmbeddings(
+                    model_name=embedding_model_name,
+                    encode_kwargs={"normalize_embeddings": True}
+                )
+                
+                # Initialize vector store
+                vector_store = MongoDBAtlasVectorSearch.from_documents(
+                    chunks,
+                    embeddings,
+                    collection=collection,
+                    index_name=pinecone_index
+                )
+                
+                logger.info(f"Successfully ingested {len(chunks)} chunks from {repo_owner}/{repo_name}")
+                return True
+                
+            except Exception as e:
+                logger.error(f"Error cloning or processing repository: {e}")
+                return False
+    except Exception as e:
+        logger.error(f"Error in ingest_github_repo: {e}")
+        return False
