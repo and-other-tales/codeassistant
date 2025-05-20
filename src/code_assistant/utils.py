@@ -19,6 +19,7 @@ import requests
 import glob
 import git
 import re
+import subprocess
 from typing import Any, Optional, Sequence
 
 from bs4 import BeautifulSoup as Soup
@@ -118,30 +119,31 @@ def format_docs(docs: Optional[Sequence[Document]]) -> str:
 </documents>"""
 
 
-def load_chat_model(fully_specified_name: str, tools: Optional[list] = None) -> BaseChatModel:
+def load_chat_model(fully_specified_name: str) -> BaseChatModel:
     """Load a chat model from a fully specified name, including Groq support."""
-    if "/" in fully_specified_name:
-        provider, model = fully_specified_name.split("/", maxsplit=1)
-    else:
-        provider = ""
-        model = fully_specified_name
+    try:
+        if "/" in fully_specified_name:
+            provider, model = fully_specified_name.split("/", maxsplit=1)
+        else:
+            provider = ""
+            model = fully_specified_name
 
-    if provider == "groq":
-        # Support for ChatGroq
-        api_key = os.getenv("GROQ_API_KEY")
-        if not api_key:
-            raise ValueError("GROQ_API_KEY environment variable must be set for Groq models.")
-        chat_model = ChatGroq(model=model, api_key=SecretStr(api_key))
-        if tools:
-            chat_model = chat_model.bind_tools(tools)
-        return chat_model
-    elif provider == "openai":
-        return init_chat_model(model, model_provider="openai")
-    elif provider == "anthropic":
-        return init_chat_model(model, model_provider="anthropic")
-    else:
-        # If provider is not recognized, try passing the full name (for future compatibility)
-        return init_chat_model(fully_specified_name)
+        if provider == "groq":
+            # Support for ChatGroq
+            api_key = os.getenv("GROQ_API_KEY")
+            if not api_key:
+                raise ValueError("GROQ_API_KEY environment variable must be set for Groq models.")
+            return ChatGroq(model=model, api_key=SecretStr(api_key))
+        elif provider == "openai":
+            return init_chat_model(model, model_provider="openai")
+        elif provider == "anthropic":
+            return init_chat_model(model, model_provider="anthropic")
+        else:
+            # If provider is not recognized, try passing the full name (for future compatibility)
+            return init_chat_model(fully_specified_name)
+    except Exception as e:
+        print(f"Error loading chat model: {e}")
+        raise ValueError(f"Failed to load chat model: {e}")
 
 
 def check_imports(imports: str) -> tuple[bool, Optional[str]]:
@@ -304,21 +306,23 @@ def ingest_github_repo(repo_url: str, mongodb_uri: str, pinecone_index: str, pin
     Ingests a GitHub repository: clones it, extracts docs/examples/cookbooks/ipynb, stores in MongoDB, and creates Pinecone vectors.
     Returns a summary dict.
     """
+    import subprocess
     temp_dir = tempfile.mkdtemp()
     try:
+        # Set git config for large repos
+        subprocess.run(["git", "config", "--global", "http.postBuffer", "157286400"], check=True)
         # Clone the repo
-        repo = git.Repo.clone_from(repo_url, temp_dir)
+        subprocess.run(["git", "clone", repo_url, temp_dir], check=True)
         # Find all relevant files
         folders = ["docs", "examples", "cookbooks"]
-        file_patterns = [
-            os.path.join(temp_dir, f, "**", "*.md") for f in folders
-        ] + [
-            os.path.join(temp_dir, f, "**", "*.rst") for f in folders
-        ] + [
-            os.path.join(temp_dir, f, "**", "*.ipynb") for f in folders
-        ] + [
-            os.path.join(temp_dir, f, "**", "*.py") for f in folders
-        ]
+        file_patterns = []
+        for f in folders:
+            file_patterns.extend([
+                os.path.join(temp_dir, f, "**", "*.md"),
+                os.path.join(temp_dir, f, "**", "*.rst"),
+                os.path.join(temp_dir, f, "**", "*.ipynb"),
+                os.path.join(temp_dir, f, "**", "*.py"),
+            ])
         files = []
         for pattern in file_patterns:
             files.extend(glob.glob(pattern, recursive=True))
