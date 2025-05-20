@@ -233,7 +233,7 @@ def make_pinecone_retriever(
     
     Args:
         user_id (str): User ID for filtering results.
-        embedding_model (Embeddings): The embedding model to use.
+        embedding_model: Embeddings: The embedding model to use.
         search_kwargs (dict[str, Any], optional): Additional search parameters.
         
     Returns:
@@ -501,7 +501,9 @@ def create_codeact_agent(model, tools, allow_net: bool = False):
     """
     try:
         from langgraph_codeact import create_codeact
-        from langgraph.checkpoint.memory import MemorySaver
+        # Use persistent checkpointer if available
+        mongodb_uri = os.environ.get("MONGODB_URI")
+        checkpointer = get_persistent_checkpointer(mongodb_uri)
     except ImportError as e:
         raise ImportError("langgraph-codeact is not installed or incompatible with current langgraph version. "
                           "Use a separate environment for codeact agent execution.\n" + str(e))
@@ -509,7 +511,7 @@ def create_codeact_agent(model, tools, allow_net: bool = False):
         result = run_code_in_pyodide_sandbox(code, allow_net=allow_net)
         return result.stdout or result.result, _locals
     code_act = create_codeact(model, tools, pyodide_sandbox_eval)
-    agent = code_act.compile(checkpointer=MemorySaver())
+    agent = code_act.compile(checkpointer=checkpointer)
     return agent
 
 
@@ -570,3 +572,42 @@ def build_agent_tools(user_tools: list, github_tools: list = None, ingestion_too
     if ingestion_tools:
         tools.extend(ingestion_tools)
     return tools
+
+
+# --- PERSISTENT LANGGRAPH CHECKPOINTER (MongoDB) ---
+
+from langgraph.checkpoint.base import BaseCheckpointSaver
+
+class MongoDBCheckpointer(BaseCheckpointSaver):
+    """
+    MongoDB-based checkpointer for LangGraph. Stores checkpoints in a MongoDB collection.
+    Implements the BaseCheckpointSaver interface.
+    """
+    def __init__(self, uri: str, db_name: str = "langgraph", collection: str = "checkpoints"):
+        from pymongo import MongoClient
+        self.client = MongoClient(uri)
+        self.collection = self.client[db_name][collection]
+
+    def put(self, config, checkpoint, *, metadata=None, new_versions=None):
+        # config is expected to be a dict with a unique key (e.g., 'config["key"]')
+        key = str(config.get("key", str(config)))
+        self.collection.replace_one({"_id": key}, {"_id": key, "checkpoint": checkpoint, "metadata": metadata, "new_versions": new_versions}, upsert=True)
+
+    def get(self, config):
+        key = str(config.get("key", str(config)))
+        doc = self.collection.find_one({"_id": key})
+        return doc["checkpoint"] if doc else None
+
+    def delete(self, config):
+        key = str(config.get("key", str(config)))
+        self.collection.delete_one({"_id": key})
+
+
+# Utility to select checkpointer
+
+def get_persistent_checkpointer(mongodb_uri: str | None = None):
+    """Return a persistent checkpointer (MongoDB) if URI is provided, else fallback to MemorySaver."""
+    if mongodb_uri:
+        return MongoDBCheckpointer(mongodb_uri)
+    from langgraph.checkpoint.memory import MemorySaver
+    return MemorySaver()

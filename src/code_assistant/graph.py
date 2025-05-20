@@ -26,6 +26,8 @@ from code_assistant.utils import (
     extract_required_modules,
     documentation_exists,
     ingest_github_repo,
+    get_github_tools,
+    build_agent_tools,
 )
 
 
@@ -147,14 +149,16 @@ async def generate_code(
         }
 
     # --- Ingestion tool logic ---
-    # Only run if a task keyword is present
     if any(kw in user_text for kw in task_keywords):
-        # Define ingestion tool schema
         ingestion_tool = {
             "type": "function",
             "function": {
                 "name": "ingest_github_repo",
-                "description": "Ingest a GitHub repository and index its documentation for semantic search.",
+                "description": (
+                    "Use this tool to ingest and index any GitHub repository for code/documentation search. "
+                    "Always use this tool if the user requests ingestion or documentation from a repo, or if you need to access code or docs from GitHub. "
+                    "Do not attempt to answer such requests directly; always call this tool."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -167,60 +171,51 @@ async def generate_code(
                 }
             }
         }
-        # Model/tool selection logic (Groq, etc.)
-        model_name = configuration.code_gen_model
-        groq_tool_models = [
-            "meta-llama/llama-4-scout-17b-16e-instruct",
-            "meta-llama/llama-4-maverick-17b-128e-instruct",
-            "qwen-qwq-32b",
-            "deepseek-r1-distill-qwen-32b",
-            "deepseek-r1-distill-llama-70b",
-            "llama-3.3-70b-versatile",
-            "llama-3.1-8b-instant",
-            "gemma2-9b-it"
-        ]
-        use_tools = False
-        if (model_name.startswith("groq/") or model_name.startswith("groq-")) and any(model_name.endswith(m) for m in groq_tool_models):
-            use_tools = True
-        # Prepare prompt and model
+        github_tools = get_github_tools(user_consent=True)
+        all_tools = build_agent_tools(user_tools=[], github_tools=github_tools, ingestion_tools=[ingestion_tool])
+        print("DEBUG: user_text:", user_text)
+        print("DEBUG: tools passed to model:", all_tools)
+        system_prompt = (
+            configuration.code_gen_system_prompt_claude +
+            "\n\nIMPORTANT: If the user requests ingestion, documentation, or code from a GitHub repository, you MUST use the available tools (such as ingest_github_repo or GitHub tools) and never answer directly."
+        )
         prompt = ChatPromptTemplate.from_messages([
-            ("system", configuration.code_gen_system_prompt_claude),
+            ("system", system_prompt),
             ("placeholder", "{messages}"),
         ])
         model = load_chat_model(configuration.code_gen_model)
-        structured_model = model.with_structured_output(CodeSolution, include_raw=True)
+        # Bind tools to the model as required by Groq
+        model_with_tools = model.bind_tools(all_tools)
+        structured_model = model_with_tools.with_structured_output(CodeSolution, include_raw=True)
         message_value = await prompt.ainvoke({
             "messages": state.messages,
             "context": formatted_docs,
         }, config)
-        # Call LLM with tool support
-        if use_tools:
-            raw_result = await structured_model.ainvoke(message_value, config, tools=[ingestion_tool])
-            tool_calls = getattr(raw_result, 'tool_calls', None)
-            if tool_calls:
-                for tool_call in tool_calls:
-                    if tool_call.get('name') == 'ingest_github_repo':
-                        repo_url = tool_call['arguments']['repo_url']
-                        mongodb_uri = configuration.mongodb_uri
-                        pinecone_index = configuration.pinecone_index
-                        pinecone_api_key = configuration.pinecone_api_key
-                        embedding_model_name = getattr(configuration, 'embedding_model_name', 'openai/text-embedding-3-small')
-                        result = ingest_github_repo(
-                            repo_url=repo_url,
-                            mongodb_uri=mongodb_uri,
-                            pinecone_index=pinecone_index,
-                            pinecone_api_key=pinecone_api_key,
-                            embedding_model_name=embedding_model_name
-                        )
-                        messages = list(messages) + [AIMessage(content=f"GitHub repo ingestion result: {result}")]
-                        return {
-                            "generation": None,
-                            "messages": messages,
-                            "iterations": iterations,
-                            "error": "" if result.get("status") == "success" else result.get("error", "ingestion error")
-                        }
-        # If not using tools, just return a fallback message
-        messages = list(messages) + [AIMessage(content="Ingestion request detected, but tool use is not enabled for this model.")]
+        raw_result = await structured_model.ainvoke(message_value, config)
+        tool_calls = getattr(raw_result, 'tool_calls', None)
+        if tool_calls:
+            for tool_call in tool_calls:
+                if tool_call.get('name') == 'ingest_github_repo':
+                    repo_url = tool_call['arguments']['repo_url']
+                    mongodb_uri = configuration.mongodb_uri
+                    pinecone_index = configuration.pinecone_index
+                    pinecone_api_key = configuration.pinecone_api_key
+                    embedding_model_name = getattr(configuration, 'embedding_model_name', 'openai/text-embedding-3-small')
+                    result = ingest_github_repo(
+                        repo_url=repo_url,
+                        mongodb_uri=mongodb_uri,
+                        pinecone_index=pinecone_index,
+                        pinecone_api_key=pinecone_api_key,
+                        embedding_model_name=embedding_model_name
+                    )
+                    messages = list(messages) + [AIMessage(content=f"GitHub repo ingestion result: {result}")]
+                    return {
+                        "generation": None,
+                        "messages": messages,
+                        "iterations": iterations,
+                        "error": "" if result.get("status") == "success" else result.get("error", "ingestion error")
+                    }
+        messages = list(messages) + [AIMessage(content="Ingestion request detected, but no tool calls were made by the model.")]
         return {"messages": messages, "iterations": iterations, "error": "", "generation": None}
     
     # Fallback return if no code path matches
