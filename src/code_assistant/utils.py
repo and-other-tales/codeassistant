@@ -20,14 +20,14 @@ import glob
 import git
 import re
 import subprocess
-from typing import Any, Optional, Sequence
+from typing import Any, Optional, Sequence, List, Dict, Union
 
 from bs4 import BeautifulSoup as Soup
 from langchain.chat_models import init_chat_model
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AnyMessage
+from langchain_core.messages import AnyMessage, BaseMessage
 from langchain_core.vectorstores import VectorStoreRetriever
 from langchain_groq import ChatGroq
 from langchain_openai import OpenAIEmbeddings
@@ -36,6 +36,30 @@ from langchain_mongodb import MongoDBAtlasVectorSearch
 from pymongo import MongoClient
 import nbformat
 from pydantic import SecretStr
+
+
+__all__ = [
+    'get_message_text',
+    'format_docs',
+    'load_chat_model',
+    'check_imports',
+    'check_code_execution',
+    'extract_documentation_from_url',
+    'make_text_encoder',
+    'make_pinecone_retriever',
+    'make_mongodb_retriever',
+    'get_document_from_mongodb',
+    'ingest_github_repo',
+    'ingest_repository',
+    'fetch_and_ingest_repos',
+    'extract_required_modules',
+    'documentation_exists',
+    'get_github_tools',
+    'build_agent_tools',
+    'extract_tool_calls',
+    'format_tool_call',
+    'check_and_ingest_missing_modules'
+]
 
 
 def get_message_text(msg: AnyMessage) -> str:
@@ -312,7 +336,7 @@ def ingest_github_repo(repo_url: str, mongodb_uri: str, pinecone_index: str, pin
         # Set git config for large repos
         subprocess.run(["git", "config", "--global", "http.postBuffer", "157286400"], check=True)
         # Clone the repo
-        subprocess.run(["git", "clone", repo_url, temp_dir], check=True)
+        subprocess.run(["git", "clone", repo_url, temp_dir"], check=True)
         # Find all relevant files
         folders = ["docs", "examples", "cookbooks"]
         file_patterns = []
@@ -381,19 +405,76 @@ def extract_required_modules(text: str) -> list[str]:
     return list(modules)
 
 
+def get_github_repo_url(module: str) -> str:
+    """
+    Convert a module name to a likely GitHub repository URL.
+    For example: 'langchain' -> 'https://github.com/langchain-ai/langchain'
+    """
+    # Map of known module to repo mappings
+    MODULE_REPO_MAP = {
+        'langchain': 'langchain-ai/langchain',
+        'langgraph': 'langchain-ai/langgraph',
+        'chromadb': 'chroma-core/chroma',
+        'pytorch': 'pytorch/pytorch',
+        'tensorflow': 'tensorflow/tensorflow',
+        'numpy': 'numpy/numpy',
+        'pandas': 'pandas-dev/pandas',
+        # Add more mappings as needed
+    }
+    
+    org_repo = MODULE_REPO_MAP.get(module, f"{module}/{module}")
+    return f"https://github.com/{org_repo}"
+
+
 def documentation_exists(module: str, mongodb_uri: str) -> bool:
     """Checks if documentation for the given module exists in MongoDB."""
-    client = MongoClient(mongodb_uri)
-    db = client["codeassist"]
-    collection = db["documentation"]
-    # Check for any document with the module name in metadata or content
-    doc = collection.find_one({
-        "$or": [
-            {"metadata.module": module},
-            {"page_content": {"$regex": rf"\\b{module}\\b", "$options": "i"}}
-        ]
-    })
-    return doc is not None
+    try:
+        client = MongoClient(mongodb_uri)
+        db = client["codeassist"]
+        collection = db["documentation"]
+        # Check for any document with the module name in metadata or content
+        doc = collection.find_one({
+            "$or": [
+                {"metadata.module": module},
+                {"page_content": {"$regex": rf"\b{module}\b", "$options": "i"}}
+            ]
+        })
+        return doc is not None
+    except Exception as e:
+        print(f"Error checking documentation existence: {e}")
+        return False
+
+
+async def check_and_ingest_missing_modules(required_modules: list[str], mongodb_uri: str, pinecone_config: dict) -> dict:
+    """
+    Check for required module documentation and ingest from GitHub if missing.
+    Returns a dict with ingestion results for each missing module.
+    """
+    missing_modules = []
+    results = {}
+    
+    # Check which modules need ingestion
+    for module in required_modules:
+        if not documentation_exists(module, mongodb_uri):
+            missing_modules.append(module)
+    
+    # Ingest missing modules
+    if missing_modules:
+        for module in missing_modules:
+            repo_url = get_github_repo_url(module)
+            try:
+                result = ingest_github_repo(
+                    repo_url=repo_url,
+                    mongodb_uri=mongodb_uri,
+                    pinecone_index=pinecone_config['index'],
+                    pinecone_api_key=pinecone_config['api_key'],
+                    embedding_model_name=pinecone_config.get('embedding_model', 'openai/text-embedding-3-small')
+                )
+                results[module] = result
+            except Exception as e:
+                results[module] = {"status": "error", "error": str(e)}
+    
+    return results
 
 
 def fetch_and_ingest_repos(
@@ -569,7 +650,7 @@ def is_tool_use_supported(model_name: str) -> bool:
     )
 
 
-def build_agent_tools(user_tools: list, github_tools: list = None, ingestion_tools: list = None) -> list:
+def build_agent_tools(user_tools: list, github_tools: list | None = None, ingestion_tools: list | None = None) -> list:
     """
     Build the list of tools to pass to the agent, including user, github, and ingestion tools.
     """
@@ -618,3 +699,20 @@ def get_persistent_checkpointer(mongodb_uri: str | None = None):
         return MongoDBCheckpointer(mongodb_uri)
     from langgraph.checkpoint.memory import MemorySaver
     return MemorySaver()
+
+
+# --- MODEL TOOLS UTILITY FUNCTIONS ---
+
+def extract_tool_calls(model_output: BaseMessage) -> List[Dict]:
+    """Extract tool calls from a model's output message."""
+    tool_calls = []
+    if hasattr(model_output, 'additional_kwargs'):
+        tool_calls = model_output.additional_kwargs.get('tool_calls', [])
+    return tool_calls
+
+def format_tool_call(tool_call: Dict) -> Dict:
+    """Format a tool call into a standardized structure."""
+    return {
+        'name': tool_call.get('function', {}).get('name', tool_call.get('name', '')),
+        'arguments': tool_call.get('function', {}).get('arguments', tool_call.get('arguments', {}))
+    }

@@ -79,3 +79,11 @@ class GraphState(InputState):
     
     documents: Annotated[Sequence[Document], add_documents] = field(default_factory=list)
     """Documents used for context in code generation."""
+
+    def get_documents(self) -> List[Document]:
+        """Fetch the state documents.
+        
+        Returns:
+            List[Document]: A list of documents used for context in code generation.
+        """
+        return self.documents or []

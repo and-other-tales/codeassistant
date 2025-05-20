@@ -1,23 +1,18 @@
-"""Main entrypoint for the code assistant graph.
+"""Main entrypoint for the code assistant graph."""
 
-This module defines the core structure and functionality of the code assistant graph.
-It includes the main graph definition, state management, and key functions for
-processing documentation, generating code, testing code, and incorporating feedback
-for improved solutions.
-"""
-
-from typing import Dict, List, Optional, cast
-
+from typing import Dict, List, Optional, Sequence, cast
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-from pydantic import BaseModel, Field
 from langchain_core.runnables import RunnableConfig
+from pydantic import BaseModel, Field
 from langgraph.graph import END, StateGraph, START
 
 from code_assistant.configuration import Configuration
 from code_assistant.state import CodeSolution, GraphState, InputState
 from code_assistant.utils import (
+    extract_tool_calls,
+    format_tool_call,
     check_code_execution,
     check_imports,
     format_docs, 
@@ -28,12 +23,12 @@ from code_assistant.utils import (
     ingest_github_repo,
     get_github_tools,
     build_agent_tools,
+    check_and_ingest_missing_modules
 )
 
 
 class SearchQuery(BaseModel):
     """Search the indexed documents for a query."""
-
     query: str
 
 
@@ -45,35 +40,14 @@ class IngestGithubRepo(BaseModel):
 async def process_documentation(
     state: GraphState, *, config: RunnableConfig
 ) -> Dict:
-    """Process documentation from the user input and state.
-    
-    This function extracts or formats documentation either from the user's messages
-    or from documents already in the state.
-    
-    Args:
-        state (GraphState): The current state containing messages and/or documents.
-        config (RunnableConfig): Configuration for the processing.
-        
-    Returns:
-        Dict: A dictionary with updated documents.
-    """
+    """Process user input for documentation or ingestion requests."""
     messages = state.messages
+    user_input = get_message_text(messages[-1]) if messages else ""
     
-    # If we already have documentation, use it
-    if state.documentation:
-        return {"documents": state.documentation}
-
-    # If a MongoDB document ID/reference is present in the state, fetch from MongoDB
-    doc_id = getattr(state, 'mongodb_doc_id', None)
-    if doc_id:
-        from code_assistant.utils import get_document_from_mongodb
-        mongo_doc = get_document_from_mongodb(doc_id)
-        if mongo_doc:
-            return {"documents": [mongo_doc]}
-
-    # Extract documentation from the latest message
-    user_input = get_message_text(messages[-1])
-    # For now, we'll just create a document from the user input
+    if not user_input:
+        return {"documents": [], "messages": messages, "error": "No user input"}
+    
+    # For now, create a document from user input
     from langchain_core.documents import Document
     doc = Document(page_content=user_input)
     return {"documents": [doc]}
@@ -82,130 +56,141 @@ async def process_documentation(
 async def generate_code(
     state: GraphState, *, config: RunnableConfig
 ) -> Dict:
-    """Generate code based on the user's question and documentation.
-    
-    This function uses an LLM to generate code that addresses the user's requirements
-    while utilizing the provided documentation.
-    
-    Args:
-        state (GraphState): The current state with user messages and documentation.
-        config (RunnableConfig): Configuration for code generation.
-        
-    Returns:
-        Dict: A dictionary with the generated code solution and updated messages.
-    """
-    print("---GENERATING CODE SOLUTION---")
-    
-    # Get configuration
-    configuration = Configuration.from_runnable_config(config)
-    
-    # Get state components
-    messages = state.messages
+    """Generate code based on user input, with built-in knowledge checking and ingestion."""
+    messages = list(state.messages)  # Convert to list for modification
     iterations = state.iterations
-    error = state.error
-    documents = state.documents
-    
-    # Format documentation
-    formatted_docs = format_docs(documents)
-    
-    # Detect if the user wants to brainstorm or have a natural language session before starting a task
-    user_text = get_message_text(messages[-1]).strip().lower()
-    brainstorm_keywords = ["brainstorm", "chat", "discuss", "idea", "think", "explore"]
-    task_keywords = ["ingest", "generate", "create", "build", "code", "github.com"]
-    if any(word in user_text for word in brainstorm_keywords) or not any(kw in user_text for kw in task_keywords):
-        brainstorm_msg = (
-            "Let's brainstorm or discuss your ideas! "
-            "Describe what you're thinking, and I'll help clarify or expand on your requirements. "
-            "When you're ready, just tell me what you'd like to build or ingest."
-        )
-        messages = list(messages) + [AIMessage(content=brainstorm_msg)]
-        return {"messages": messages, "iterations": iterations, "error": "", "generation": None}
+    user_text = get_message_text(messages[-1])
+    formatted_docs = format_docs(state.get_documents())
+    configuration = cast(Configuration, config.get("configurable", {}))
 
-    # --- Pre-codegen documentation check ---
-    mongodb_uri = configuration.mongodb_uri
-    # Extract required modules from user request
-    required_modules = extract_required_modules(user_text)
-    missing_modules = [m for m in required_modules if not documentation_exists(m, mongodb_uri)]
-    if missing_modules:
-        # Attempt to ingest missing modules from GitHub (assume repo URL is github.com/{module}/{module})
-        ingestion_results = []
-        for module in missing_modules:
-            repo_url = f"https://github.com/{module}/{module}"
-            pinecone_index = configuration.pinecone_index
-            pinecone_api_key = configuration.pinecone_api_key
-            embedding_model_name = getattr(configuration, 'embedding_model_name', 'openai/text-embedding-3-small')
-            result = ingest_github_repo(
-                repo_url=repo_url,
-                mongodb_uri=mongodb_uri,
-                pinecone_index=pinecone_index,
-                pinecone_api_key=pinecone_api_key,
-                embedding_model_name=embedding_model_name
-            )
-            ingestion_results.append((module, result))
-        # Inform user and halt codegen until docs are present
-        msg = "Some required modules were missing documentation. Ingestion attempted for: "
-        msg += ", ".join([f"{m} (status: {r['status']})" for m, r in ingestion_results])
-        messages = list(messages) + [AIMessage(content=msg)]
-        return {
-            "messages": messages,
-            "iterations": iterations,
-            "error": "Missing documentation for required modules.",
-            "generation": None
-        }
-
-    # --- Ingestion tool logic ---
-    if any(kw in user_text for kw in task_keywords):
-        # Use Pydantic model for ingestion tool
+    # Check for ingestion requests
+    if "ingest" in user_text.lower() and "github" in user_text.lower():
         github_tools = get_github_tools(user_consent=True)
-        all_tools = build_agent_tools(user_tools=[], github_tools=github_tools, ingestion_tools=[IngestGithubRepo])
-        print("DEBUG: user_text:", user_text)
-        print("DEBUG: tools passed to model:", all_tools)
+        all_tools = build_agent_tools(
+            user_tools=[], 
+            github_tools=github_tools, 
+            ingestion_tools=[IngestGithubRepo]
+        )
+        model = load_chat_model(configuration.code_gen_model)
+        model_with_tools = model.bind_tools(all_tools)
+        
+        try:
+            result = model_with_tools.invoke(messages)
+            tool_calls = extract_tool_calls(result)
+            
+            for tool_call in tool_calls:
+                formatted_call = format_tool_call(tool_call)
+                if formatted_call['name'] == 'IngestGithubRepo':
+                    args = formatted_call['arguments']
+                    result = ingest_github_repo(
+                        repo_url=args['repo_url'],
+                        mongodb_uri=configuration.mongodb_uri,
+                        pinecone_index=configuration.pinecone_index,
+                        pinecone_api_key=configuration.pinecone_api_key
+                    )
+                    messages.append(AIMessage(content=f"GitHub repo ingestion complete: {result['status']}"))
+                    return {
+                        "messages": messages,
+                        "iterations": iterations,
+                        "error": "",
+                        "generation": None
+                    }
+        except Exception as e:
+            messages.append(AIMessage(content=f"Error during ingestion: {str(e)}"))
+            return {
+                "messages": messages,
+                "iterations": iterations,
+                "error": str(e),
+                "generation": None
+            }
+    
+    # For code generation requests, check required knowledge
+    required_modules = extract_required_modules(user_text)
+    if required_modules:
+        # Validate documentation exists for all required modules
+        missing_modules = [m for m in required_modules if not documentation_exists(m, configuration.mongodb_uri)]
+        if missing_modules:
+            # Attempt to ingest missing modules
+            ingestion_results = await check_and_ingest_missing_modules(
+                required_modules=missing_modules,
+                mongodb_uri=configuration.mongodb_uri,
+                pinecone_config={
+                    'index': configuration.pinecone_index,
+                    'api_key': configuration.pinecone_api_key
+                }
+            )
+            
+            # Check results and proceed or halt
+            failed_ingestions = {m: r for m, r in ingestion_results.items() if r.get('status') != 'success'}
+            if failed_ingestions:
+                msg = f"Unable to proceed with code generation. Failed to ingest documentation for: {', '.join(failed_ingestions.keys())}"
+                messages.append(AIMessage(content=msg))
+                return {
+                    "messages": messages,
+                    "iterations": iterations,
+                    "error": "Missing required module documentation",
+                    "generation": None
+                }
+            else:
+                msg = f"Successfully ingested documentation for: {', '.join(ingestion_results.keys())}"
+                messages.append(AIMessage(content=msg))
+    
+    # Proceed with code generation with validated knowledge
+    github_tools = get_github_tools(user_consent=True)
+    all_tools = build_agent_tools(
+        user_tools=[], 
+        github_tools=github_tools,
+        ingestion_tools=[IngestGithubRepo]
+    )
+
+    model = load_chat_model(configuration.code_gen_model)
+    model_with_tools = model.bind_tools(all_tools)
+
+    try:
         system_prompt = (
             configuration.code_gen_system_prompt_claude +
-            "\n\nIMPORTANT: If the user requests ingestion, documentation, or code from a GitHub repository, you MUST use the available tools (such as IngestGithubRepo or GitHub tools) and never answer directly."
+            "\n\nIMPORTANT: If you need documentation or code from a GitHub repository, "
+            "use the available tools and never answer without proper documentation."
         )
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_prompt),
             ("placeholder", "{messages}"),
         ])
-        model = load_chat_model(configuration.code_gen_model)
-        # Bind tools to the model as required by Groq
-        model_with_tools = model.bind_tools(all_tools)
-        structured_model = model_with_tools.with_structured_output(CodeSolution, include_raw=True)
-        message_value = await prompt.ainvoke({
-            "messages": state.messages,
-            "context": formatted_docs,
-        }, config)
-        raw_result = await structured_model.ainvoke(message_value, config)
-        tool_calls = getattr(raw_result, 'tool_calls', None)
-        if tool_calls:
-            for tool_call in tool_calls:
-                # For Pydantic model, the name will be the class name
-                if tool_call.get('name') == 'IngestGithubRepo':
-                    repo_url = tool_call['arguments']['repo_url']
-                    mongodb_uri = configuration.mongodb_uri
-                    pinecone_index = configuration.pinecone_index
-                    pinecone_api_key = configuration.pinecone_api_key
-                    embedding_model_name = getattr(configuration, 'embedding_model_name', 'openai/text-embedding-3-small')
-                    result = ingest_github_repo(
-                        repo_url=repo_url,
-                        mongodb_uri=mongodb_uri,
-                        pinecone_index=pinecone_index,
-                        pinecone_api_key=pinecone_api_key,
-                        embedding_model_name=embedding_model_name
-                    )
-                    messages = list(messages) + [AIMessage(content=f"GitHub repo ingestion result: {result}")]
-                    return {
-                        "generation": None,
-                        "messages": messages,
-                        "iterations": iterations,
-                        "error": "" if result.get("status") == "success" else result.get("error", "ingestion error")
-                    }
-        messages = list(messages) + [AIMessage(content="Ingestion request detected, but no tool calls were made by the model.")]
-        return {"messages": messages, "iterations": iterations, "error": "", "generation": None}
-    
-    # Fallback return if no code path matches
-    return {"messages": messages, "iterations": iterations, "error": "No valid codegen path taken.", "generation": None}
+
+        message_value = prompt.format_messages(messages=messages, context=formatted_docs)
+        result = model_with_tools.invoke(message_value)
+        
+        # Extract any tool calls
+        tool_calls = extract_tool_calls(result)
+        for tool_call in tool_calls:
+            formatted_call = format_tool_call(tool_call)
+            if formatted_call['name'] == 'IngestGithubRepo':
+                # Handle additional ingestion requests
+                args = formatted_call['arguments']
+                ingestion_result = ingest_github_repo(
+                    repo_url=args['repo_url'],
+                    mongodb_uri=configuration.mongodb_uri,
+                    pinecone_index=configuration.pinecone_index,
+                    pinecone_api_key=configuration.pinecone_api_key
+                )
+                messages.append(AIMessage(content=f"Additional repo ingestion result: {ingestion_result['status']}"))
+        
+        # Return the final result
+        return {
+            "messages": messages,
+            "iterations": iterations + 1,
+            "error": "",
+            "generation": result
+        }
+        
+    except Exception as e:
+        messages.append(AIMessage(content=f"Error during code generation: {str(e)}"))
+        return {
+            "messages": messages,
+            "iterations": iterations,
+            "error": str(e),
+            "generation": None
+        }
 
 
 # Build the graph
@@ -214,12 +199,10 @@ builder = StateGraph(GraphState, input=InputState, config_schema=Configuration)
 # Add nodes
 builder.add_node("process_documentation", process_documentation)
 builder.add_node("generate", generate_code)
-# Add other nodes as needed (e.g., check_code, reflect) if they exist
 
 # Add edges
 builder.add_edge(START, "process_documentation")
 builder.add_edge("process_documentation", "generate")
-# Add other edges as needed
 
 # Compile the graph
 graph = builder.compile()
