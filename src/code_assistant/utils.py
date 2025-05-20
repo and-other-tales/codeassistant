@@ -118,7 +118,7 @@ def format_docs(docs: Optional[Sequence[Document]]) -> str:
 </documents>"""
 
 
-def load_chat_model(fully_specified_name: str) -> BaseChatModel:
+def load_chat_model(fully_specified_name: str, tools: Optional[list] = None) -> BaseChatModel:
     """Load a chat model from a fully specified name, including Groq support."""
     if "/" in fully_specified_name:
         provider, model = fully_specified_name.split("/", maxsplit=1)
@@ -131,7 +131,10 @@ def load_chat_model(fully_specified_name: str) -> BaseChatModel:
         api_key = os.getenv("GROQ_API_KEY")
         if not api_key:
             raise ValueError("GROQ_API_KEY environment variable must be set for Groq models.")
-        return ChatGroq(model=model, api_key=SecretStr(api_key))
+        chat_model = ChatGroq(model=model, api_key=SecretStr(api_key))
+        if tools:
+            chat_model = chat_model.bind_tools(tools)
+        return chat_model
     elif provider == "openai":
         return init_chat_model(model, model_provider="openai")
     elif provider == "anthropic":
