@@ -1,6 +1,13 @@
-"""Main entrypoint for the code assistant graph."""
+"""LangGraph implementation of the code assistant.
 
-from typing import Dict, List, Optional, Sequence, cast, Any
+This module contains the state definitions and graph configuration
+for the code assistant using LangGraph.
+"""
+
+import re
+import json
+from typing import Dict, List, Optional, Any, cast, Tuple, Sequence
+
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
@@ -11,20 +18,19 @@ from langgraph.graph import END, StateGraph, START
 from code_assistant.configuration import Configuration
 from code_assistant.state import CodeSolution, GraphState, InputState
 from code_assistant.tools import (
-    extract_tool_calls,
-    format_tool_call,
     extract_required_modules,
     documentation_exists,
+    check_and_ingest_missing_modules,
+    extract_tool_calls,
+    format_tool_call,
     get_github_tools,
-    build_agent_tools,
-    check_and_ingest_missing_modules
+    build_agent_tools
 )
 from code_assistant.utils import (
-    check_code_execution,
-    check_imports,
-    format_docs, 
     get_message_text,
+    format_docs,
     load_chat_model,
+    check_code_execution,
     ingest_github_repo
 )
 
@@ -63,7 +69,7 @@ async def generate_code(
     iterations = state.iterations
     user_text = get_message_text(messages[-1])
     formatted_docs = format_docs(state.get_documents())
-    configuration = cast(Configuration, config.get("configurable", {}))
+    configuration = Configuration.from_runnable_config(config)
     missing_modules = []  # Initialize with empty list to avoid "possibly unbound" error
 
     # Check for ingestion requests
@@ -78,13 +84,8 @@ async def generate_code(
         model_with_tools = model.bind_tools(all_tools)
         
         try:
-            # Enable streaming in the config
-            stream_config = dict(config)  # Create a copy of the config
-            stream_config["callbacks"] = config.get("callbacks", [])
-            stream_config["stream"] = True
-            
-            # Stream the response
-            result = await model_with_tools.ainvoke(messages, config=cast(RunnableConfig, stream_config))
+            # Stream the response by using the streaming parameter
+            result = await model_with_tools.ainvoke(messages, config=config, streaming=True)
             tool_calls = extract_tool_calls(result)
             
             for tool_call in tool_calls:
@@ -188,15 +189,11 @@ async def generate_code(
 
         message_value = prompt.format_messages(messages=messages, context=formatted_docs)
         
-        # Set up streaming configuration
-        stream_config = dict(config)  # Create a copy of the config
-        stream_config["callbacks"] = config.get("callbacks", [])
-        stream_config["stream"] = True
-        
-        # Use astream_events for more granular streaming
+        # Use astream_events for more granular streaming with streaming parameter
         event_generator = model_with_tools.astream_events(
             message_value,
-            config=cast(RunnableConfig, stream_config),
+            config=config,
+            streaming=True,
             version="v1"
         )
         
@@ -224,7 +221,6 @@ async def generate_code(
             code_content = str(result.content)  # Convert content to string to ensure it's processable
             
             # Extract code blocks
-            import re
             code_blocks = re.findall(r"```(?:python)?\s*(.*?)```", code_content, re.DOTALL)
             
             if code_blocks:
