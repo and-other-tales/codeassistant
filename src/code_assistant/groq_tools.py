@@ -10,6 +10,7 @@ import json
 import logging
 import asyncio
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Type, Union, cast, Callable, AsyncIterator, Coroutine
+from uuid import UUID
 
 import requests
 from langchain.pydantic_v1 import BaseModel, Field, SecretStr, root_validator
@@ -18,7 +19,9 @@ from langchain_core.callbacks.manager import CallbackManagerForLLMRun, AsyncCall
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import (
     AIMessage,
+    AIMessageChunk,
     BaseMessage,
+    BaseMessageChunk,
     ChatMessage,
     FunctionMessage,
     HumanMessage,
@@ -258,7 +261,7 @@ class ChatGroq(BaseChatModel):
                             if "content" in delta and delta["content"] is not None:
                                 content_buffer += delta["content"]
                                 # Yield content updates as chunks
-                                chunk_message = AIMessage(content=delta["content"])
+                                chunk_message = AIMessageChunk(content=delta["content"])
                                 yield ChatGenerationChunk(message=chunk_message)
                             
                             if "tool_calls" in delta:
@@ -301,7 +304,7 @@ class ChatGroq(BaseChatModel):
                                     }
                                     for tc in function_calls_buffer
                                 ]}
-                                message = AIMessage(content="", additional_kwargs=additional_kwargs)
+                                message = AIMessageChunk(content="", additional_kwargs=additional_kwargs)
                                 yield ChatGenerationChunk(message=message)
                         
                         except (json.JSONDecodeError, KeyError) as e:
@@ -404,12 +407,15 @@ class ChatGroq(BaseChatModel):
             handlers = getattr(run_manager, "handlers", [])
             tags = getattr(run_manager, "tags", [])
             metadata = getattr(run_manager, "metadata", {})
+            run_id = getattr(run_manager, "run_id", None) or UUID(int=0)
+            
             sync_manager = CallbackManagerForLLMRun(
                 handlers=handlers,
                 tags=tags,
                 metadata=metadata,
                 inheritable_handlers=[],
                 parent_run_id=None,
+                run_id=run_id,
             )
         
         # Run synchronous _generate in a thread pool
@@ -439,15 +445,18 @@ class ChatGroq(BaseChatModel):
             handlers = getattr(run_manager, "handlers", [])
             tags = getattr(run_manager, "tags", [])
             metadata = getattr(run_manager, "metadata", {})
+            run_id = getattr(run_manager, "run_id", None) or UUID(int=0)
+            
             sync_manager = CallbackManagerForLLMRun(
                 handlers=handlers,
                 tags=tags,
                 metadata=metadata,
                 inheritable_handlers=[],
                 parent_run_id=None,
+                run_id=run_id,
             )
             
-        # Convert synchronous iterator to async iterator
+        # Create async generator to yield chunks from synchronous iterator
         iterator = self._stream(
             messages=messages,
             stop=stop,
@@ -455,5 +464,6 @@ class ChatGroq(BaseChatModel):
             **kwargs
         )
         
+        # Process iterator in a way that works with async
         for chunk in iterator:
             yield chunk
