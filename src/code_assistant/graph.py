@@ -109,10 +109,32 @@ async def generate_code(
             "For example, you can say: 'Please ingest the GitHub repository at ...', "
             "or 'I'd like you to create a FastAPI endpoint.'\n\nHow can I help you today?"
         )
-        # Use AIMessage for consistency with message types
         messages = list(messages) + [AIMessage(content=intro)]
         # Set special error flag to end the graph after intro
         return {"messages": messages, "iterations": iterations, "error": "__intro__", "generation": None}
+
+    # Check for ingestion request and Groq model/tool support
+    if "ingest" in user_text or "github.com" in user_text:
+        model_name = configuration.code_gen_model
+        # List of Groq models that support tool use/function calling
+        groq_tool_models = [
+            "meta-llama/llama-4-scout-17b-16e-instruct",
+            "meta-llama/llama-4-maverick-17b-128e-instruct",
+            "qwen-qwq-32b",
+            "deepseek-r1-distill-qwen-32b",
+            "deepseek-r1-distill-llama-70b",
+            "llama-3.3-70b-versatile",
+            "llama-3.1-8b-instant",
+            "gemma2-9b-it"
+        ]
+        if (model_name.startswith("groq/") or model_name.startswith("groq-")) and not any(model_name.endswith(m) for m in groq_tool_models):
+            # Groq models except those above do not support function/tool calling
+            error_msg = (
+                "Sorry, ingestion of GitHub repositories is not supported with this Groq model. "
+                "Please switch to OpenAI, Anthropic, or use a Groq model that supports tool use (see https://console.groq.com/docs/tool-use) for this feature."
+            )
+            messages = list(messages) + [AIMessage(content=error_msg)]
+            return {"messages": messages, "iterations": iterations, "error": "__intro__", "generation": None}
     
     # If we have an error, prepare to regenerate with error info
     if error and error != "__intro__":
