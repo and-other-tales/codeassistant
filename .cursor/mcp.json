@@ -1,0 +1,17 @@
+{
+    "mcpServers": {
+      "langchain Docs": {
+        "url": "https://gitmcp.io/langchain-ai/langchain"
+      },
+      "langgraph Docs": {
+        "url": "https://gitmcp.io/langchain-ai/langgraph"
+      },
+      "huggingface Datasets Docs": {
+        "url": "https://gitmcp.io/huggingface/datasets"
+      },
+      "huggingface Transformers Docs": {
+        "url": "https://gitmcp.io/huggingface/transformers"
+      } 
+
+    }
+  }

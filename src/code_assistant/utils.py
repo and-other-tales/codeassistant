@@ -166,15 +166,15 @@ def load_chat_model(fully_specified_name: str) -> BaseChatModel:
             model = fully_specified_name
 
         if provider.lower() == "groq":
-            # Enhanced support for ChatGroq with proper tool-calling support
+            # Use our custom ChatGroq implementation for better tool support
             from code_assistant.groq_tools import ChatGroq
             api_key = os.getenv("GROQ_API_KEY")
             if not api_key:
                 raise ValueError("GROQ_API_KEY environment variable must be set for Groq models.")
             
-            from pydantic.v1 import SecretStr
+            from langchain.pydantic_v1 import SecretStr
             secret_key = SecretStr(api_key)
-            return ChatGroq(model=model, api_key=secret_key)
+            return ChatGroq(model=model, groq_api_key=secret_key)
         elif provider.lower() == "openai":
             return init_chat_model(model, model_provider="openai")
         elif provider.lower() == "anthropic":
@@ -204,22 +204,69 @@ def check_imports(imports: str) -> tuple[bool, Optional[str]]:
         return False, str(e)
 
 
-def check_code_execution(imports: str, code: str) -> tuple[bool, Optional[str]]:
+async def check_code_execution(code: str) -> Dict[str, Any]:
     """Check if the provided code executes without errors.
     
     Args:
-        imports (str): The import statements.
         code (str): The code to test.
         
     Returns:
-        tuple[bool, Optional[str]]: A tuple containing a boolean indicating success
-                                   and an optional error message.
+        Dict[str, Any]: A dictionary with the following keys:
+            - success (bool): Whether the code executed successfully
+            - error (Optional[str]): Error message if execution failed
+            - description (str): Description of the execution result
     """
     try:
-        exec(imports + "\n" + code)
-        return True, None
+        # Extract imports from code
+        import re
+        import_lines = []
+        code_lines = []
+        
+        for line in code.split('\n'):
+            if line.strip().startswith('import ') or line.strip().startswith('from '):
+                import_lines.append(line)
+            else:
+                code_lines.append(line)
+                
+        imports = '\n'.join(import_lines)
+        code_without_imports = '\n'.join(code_lines)
+        
+        # Check imports first
+        imports_success, imports_error = check_imports(imports)
+        if not imports_success:
+            return {
+                "success": False,
+                "error": f"Import error: {imports_error}",
+                "description": f"Failed to import required modules: {imports_error}"
+            }
+        
+        # Create a temporary globals dictionary to avoid modifying the global state
+        globals_dict = {}
+        
+        # Execute the imports in the isolated globals dictionary
+        exec(imports, globals_dict)
+        
+        # Execute the code in the same globals dictionary
+        try:
+            exec(code_without_imports, globals_dict)
+            return {
+                "success": True,
+                "error": None,
+                "description": "Code executed successfully"
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": str(e),
+                "description": f"Runtime error: {str(e)}"
+            }
     except Exception as e:
-        return False, str(e)
+        # Catch any other exceptions that might occur during the checking process
+        return {
+            "success": False,
+            "error": str(e),
+            "description": f"Error during code verification: {str(e)}"
+        }
 
 
 def extract_documentation_from_url(url: str) -> list[Document]:

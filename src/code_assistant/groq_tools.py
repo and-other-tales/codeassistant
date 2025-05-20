@@ -1,243 +1,420 @@
-from typing import Any, Dict, List, Optional, Union, cast, Callable, Sequence, Iterator, Mapping, AsyncIterator, Type
-from langchain_core.callbacks.base import Callbacks, BaseCallbackManager, BaseCallbackHandler
-from langchain_core.callbacks.manager import (
-    AsyncCallbackManagerForLLMRun,
-    CallbackManagerForLLMRun
-)
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage, BaseMessageChunk, AIMessageChunk, HumanMessage, SystemMessage, ToolMessage
-from langchain_core.pydantic_v1 import root_validator, SecretStr, Field, BaseModel
-from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult, Generation
-from langchain_core.runnables import RunnableConfig
-from langchain_core.tools import BaseTool, ToolException
-import asyncio
-import os
-import json
-from uuid import UUID
-from copy import deepcopy
-from typing_extensions import TypedDict
+"""Groq integration for LangChain with enhanced tool support.
 
-# Define a type that matches RunnableConfig structure for type checking
-class ConfigDict(TypedDict, total=False):
-    callbacks: Any
-    tags: List[str]
-    metadata: Dict[str, Any]
-    run_name: str
-    configurable: Dict[str, Any]
+This module provides improved Groq chat model integration for LangChain,
+with proper support for tool calling and structured outputs.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import asyncio
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Type, Union, cast, Callable, AsyncIterator, Coroutine
+
+import requests
+from langchain.pydantic_v1 import BaseModel, Field, SecretStr, root_validator
+from langchain_core.callbacks import Callbacks
+from langchain_core.callbacks.manager import CallbackManagerForLLMRun, AsyncCallbackManagerForLLMRun
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    ChatMessage,
+    FunctionMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
+from langchain_core.outputs import ChatGeneration, ChatResult, ChatGenerationChunk
+from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import BaseTool
+from langchain_core.utils.function_calling import convert_to_openai_tool
+
+logger = logging.getLogger(__name__)
+
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+
 
 class ChatGroq(BaseChatModel):
-    """Chat model implementation for Groq.
+    """Groq chat model with tool calling support."""
+
+    model: str = "llama3-8b-8192"
+    """Model name to use."""
     
-    This implementation provides support for the Groq API with 
-    proper tool calling capabilities.
-    """
+    temperature: float = 0.7
+    """What sampling temperature to use."""
     
-    api_key: Optional[SecretStr] = None
-    model: str = Field(..., description="The name of the Groq model to use")
-    temperature: float = Field(0.7, description="Sampling temperature to use")
-    top_p: float = Field(0.7, description="The top-p sampling parameter")
-    max_tokens: Optional[int] = Field(None, description="Maximum number of tokens to generate")
+    max_tokens: Optional[int] = None
+    """Maximum number of tokens to generate."""
     
-    @root_validator(pre=True)
+    top_p: float = 1.0
+    """Total probability mass of tokens to consider at each step."""
+    
+    model_kwargs: Dict[str, Any] = Field(default_factory=dict)
+    """Holds any model parameters valid for the Groq API not explicitly specified."""
+    
+    groq_api_key: Optional[SecretStr] = None
+    """Groq API key."""
+    
+    streaming: bool = False
+    """Whether to stream the response."""
+
+    @root_validator()
     def validate_environment(cls, values: Dict) -> Dict:
-        """Validate that api key exists in environment."""
-        api_key = values.get("api_key") or os.environ.get("GROQ_API_KEY")
-        if not api_key:
-            raise ValueError(
-                "Either `api_key` parameter or `GROQ_API_KEY` environment variable must be set"
-            )
-        values["api_key"] = SecretStr(api_key) if isinstance(api_key, str) else api_key
-        
-        # Validate model
-        if not values.get("model"):
-            values["model"] = os.environ.get("GROQ_MODEL", "llama3-8b-8192")
-        
+        """Validate that the API key is provided."""
+        groq_api_key = values.get("groq_api_key")
+        if groq_api_key is None or groq_api_key.get_secret_value() == "":
+            try:
+                import os
+                groq_api_key = os.environ["GROQ_API_KEY"]
+                values["groq_api_key"] = SecretStr(groq_api_key)
+            except KeyError:
+                raise ValueError(
+                    "Groq API key not found. Please set the GROQ_API_KEY environment "
+                    "variable or pass it to the constructor as groq_api_key."
+                )
         return values
-    
+
     @property
     def _llm_type(self) -> str:
-        """Return the type of LLM."""
-        return "groq"
-        
-    @property
-    def _identifying_params(self) -> Dict[str, Any]:
-        """Get the identifying parameters."""
-        return {
+        """Return type of LLM."""
+        return "groq-chat"
+
+    def _convert_messages_to_groq_format(
+        self, messages: List[BaseMessage], tools: Optional[List[Dict]] = None
+    ) -> Dict:
+        """Convert messages to the format expected by the Groq API."""
+        message_dicts = []
+        for message in messages:
+            message_dict = {"role": self._convert_message_to_role(message), "content": message.content}
+            if isinstance(message, AIMessage) and message.tool_calls:
+                groq_tool_calls = []
+                for tool_call in message.tool_calls:
+                    groq_tool_call = {
+                        "id": tool_call.get("id", f"call_{len(groq_tool_calls)}"),
+                        "type": "function",
+                        "function": {
+                            "name": tool_call.get("name", ""),
+                            "arguments": json.dumps(tool_call.get("args", {})),
+                        },
+                    }
+                    groq_tool_calls.append(groq_tool_call)
+                if groq_tool_calls:
+                    message_dict["tool_calls"] = groq_tool_calls
+            if isinstance(message, ToolMessage):
+                message_dict["role"] = "tool"
+                message_dict["tool_call_id"] = message.tool_call_id
+                message_dict["name"] = getattr(message, "name", None)
+            message_dicts.append(message_dict)
+
+        payload = {
             "model": self.model,
+            "messages": message_dicts,
             "temperature": self.temperature,
             "top_p": self.top_p,
-            "max_tokens": self.max_tokens,
+            "stream": self.streaming,
+            **self.model_kwargs,
         }
+
+        if self.max_tokens is not None:
+            payload["max_tokens"] = self.max_tokens
+            
+        if tools:
+            # Llama 3 models in Groq support tool_choice "auto" which is the default
+            payload["tools"] = tools
+
+        return payload
+
+    def _convert_message_to_role(self, message: BaseMessage) -> str:
+        """Convert message to role for the Groq API."""
+        if isinstance(message, ChatMessage):
+            return message.role
+        elif isinstance(message, HumanMessage):
+            return "user"
+        elif isinstance(message, AIMessage):
+            return "assistant"
+        elif isinstance(message, SystemMessage):
+            return "system"
+        elif isinstance(message, ToolMessage):
+            return "tool"
+        elif isinstance(message, FunctionMessage):
+            return "function"
+        else:
+            raise ValueError(f"Unknown message type: {type(message)}")
+
+    def _create_chat_result(self, response: Mapping[str, Any]) -> ChatResult:
+        """Create a ChatResult from the response."""
+        message = response["choices"][0]["message"]
+        role = message.get("role", "assistant")
+        content = message.get("content", "")
         
-    def _invoke_tools(
+        tool_calls = None
+        if "tool_calls" in message:
+            tool_calls = []
+            for tool_call in message["tool_calls"]:
+                if tool_call["type"] == "function":
+                    function_call = tool_call["function"]
+                    tool_calls.append({
+                        "id": tool_call["id"],
+                        "type": "function",
+                        "name": function_call["name"],
+                        "args": json.loads(function_call["arguments"])
+                    })
+        
+        additional_kwargs = {}
+        if tool_calls:
+            additional_kwargs["tool_calls"] = tool_calls
+            
+        message = AIMessage(content=content, additional_kwargs=additional_kwargs)
+
+        return ChatResult(
+            generations=[ChatGeneration(message=message)],
+            llm_output={
+                "token_usage": response.get("usage", {}),
+                "model_name": self.model,
+            },
+        )
+
+    def _generate(
         self, 
         messages: List[BaseMessage], 
-        tools: List[dict], 
+        stop: Optional[List[str]] = None,
         run_manager: Optional[CallbackManagerForLLMRun] = None,
-        **kwargs
-    ) -> AIMessage:
-        """Process tool invocations for Groq models."""
-        try:
-            # Import at runtime to avoid dependency issues
-            from langchain_groq import ChatGroq as LangchainGroq
+        **kwargs: Any,
+    ) -> ChatResult:
+        """Generate with tools if provided."""
+        if stop is not None:
+            raise ValueError("Stop sequences are not yet supported for Groq.")
+        
+        tools = kwargs.pop("tools", None)
+        
+        if self.groq_api_key is None:
+            raise ValueError("groq_api_key cannot be None")
             
-            # Collect parameters
-            params = {
-                "temperature": kwargs.get("temperature", self.temperature),
-                "top_p": kwargs.get("top_p", self.top_p),
-                "max_tokens": kwargs.get("max_tokens", self.max_tokens)
-            }
-            
-            # Convert SecretStr to string for the API
-            api_key_value = self.api_key.get_secret_value() if self.api_key else None
-            
-            # Create an instance passing the raw string value
-            groq = LangchainGroq(
-                api_key=api_key_value,  # Pass the raw string, not wrapped in SecretStr
-                model=self.model,
-                **{k: v for k, v in params.items() if v is not None}
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.groq_api_key.get_secret_value()}",
+        }
+        
+        payload = self._convert_messages_to_groq_format(messages, tools)
+        
+        response = requests.post(GROQ_API_URL, headers=headers, json=payload)
+        
+        if response.status_code != 200:
+            raise ValueError(
+                f"Groq API returned error status code: {response.status_code}. "
+                f"Response content: {response.text}"
             )
-            
-            # Create a proper callbacks configuration using BaseCallbackManager if available
-            from langchain_core.callbacks.manager import CallbackManager
-            callbacks = None
-            if run_manager:
-                handlers = getattr(run_manager, "handlers", [])
-                callbacks = CallbackManager(handlers=handlers)
-            
-            config = RunnableConfig(callbacks=callbacks)
-            
-            # Bind tools to model
-            model_with_tools = groq.bind_tools(tools)
-            result = model_with_tools.invoke(messages, config=config)
-            
-            # Ensure the result is an AIMessage
-            if isinstance(result, AIMessage):
-                return result
-            else:
-                return AIMessage(content=str(result))
-        except Exception as e:
-            raise ValueError(f"Error invoking Groq tools: {str(e)}")
-            
+        
+        return self._create_chat_result(response.json())
+
     def _stream(
-        self,
-        messages: List[BaseMessage],
+        self, 
+        messages: List[BaseMessage], 
         stop: Optional[List[str]] = None,
         run_manager: Optional[CallbackManagerForLLMRun] = None,
-        **kwargs
+        **kwargs: Any,
     ) -> Iterator[ChatGenerationChunk]:
-        """Stream the response for the given messages."""
-        try:
-            # Import required modules
-            from langchain_groq import ChatGroq as LangchainGroq
-            from langchain_core.callbacks.manager import CallbackManager
+        """Stream the response from the model."""
+        if stop is not None:
+            raise ValueError("Stop sequences are not yet supported for Groq.")
+        
+        tools = kwargs.pop("tools", None)
+        
+        if self.groq_api_key is None:
+            raise ValueError("groq_api_key cannot be None")
             
-            # Extract parameters
-            params = {
-                "temperature": kwargs.get("temperature", self.temperature),
-                "top_p": kwargs.get("top_p", self.top_p),
-                "max_tokens": kwargs.get("max_tokens", self.max_tokens),
-            }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.groq_api_key.get_secret_value()}",
+            "Accept": "text/event-stream",
+        }
+        
+        payload = self._convert_messages_to_groq_format(messages, tools)
+        payload["stream"] = True
+        
+        with requests.post(GROQ_API_URL, headers=headers, json=payload, stream=True) as response:
+            if response.status_code != 200:
+                raise ValueError(
+                    f"Groq API returned error status code: {response.status_code}. "
+                    f"Response content: {response.text}"
+                )
             
-            # Convert SecretStr to string
-            api_key_value = self.api_key.get_secret_value() if self.api_key else None
+            content_buffer = ""
+            function_calls_buffer = []
             
-            # Create the model passing the raw string value
-            groq = LangchainGroq(
-                api_key=api_key_value,  # Pass the raw string, not wrapped in SecretStr
-                model=self.model,
-                streaming=True,
-                **{k: v for k, v in params.items() if v is not None}
-            )
+            for line in response.iter_lines():
+                if line:
+                    line = line.decode("utf-8")
+                    if line.startswith("data: "):
+                        line = line[6:]  # Remove "data: " prefix
+                        if line.strip() == "[DONE]":
+                            break
+                        
+                        try:
+                            chunk = json.loads(line)
+                            delta = chunk["choices"][0]["delta"]
+                            
+                            if "content" in delta and delta["content"] is not None:
+                                content_buffer += delta["content"]
+                                # Yield content updates as chunks
+                                chunk_message = AIMessage(content=delta["content"])
+                                yield ChatGenerationChunk(message=chunk_message)
+                            
+                            if "tool_calls" in delta:
+                                # Process tool calls in the stream
+                                for tool_call in delta["tool_calls"]:
+                                    # Check if this is a new tool call or update to existing one
+                                    tool_call_id = tool_call.get("id")
+                                    
+                                    # Find existing tool call or create a new one
+                                    existing_call = next((
+                                        c for c in function_calls_buffer 
+                                        if c.get("id") == tool_call_id
+                                    ), None)
+                                    
+                                    if not existing_call:
+                                        # New tool call
+                                        function_calls_buffer.append({
+                                            "id": tool_call_id,
+                                            "type": "function",
+                                            "name": tool_call.get("function", {}).get("name", ""),
+                                            "args": tool_call.get("function", {}).get("arguments", "")
+                                        })
+                                    else:
+                                        # Update existing call
+                                        if "function" in tool_call:
+                                            if "name" in tool_call["function"]:
+                                                existing_call["name"] += tool_call["function"]["name"]
+                                            if "arguments" in tool_call["function"]:
+                                                existing_call["args"] += tool_call["function"]["arguments"]
+                                
+                                # Yield a chunk for tool calls
+                                additional_kwargs = {"tool_calls": [
+                                    {
+                                        "id": tc.get("id", ""),
+                                        "type": "function",
+                                        "function": {
+                                            "name": tc.get("name", ""),
+                                            "arguments": tc.get("args", "{}")
+                                        }
+                                    }
+                                    for tc in function_calls_buffer
+                                ]}
+                                message = AIMessage(content="", additional_kwargs=additional_kwargs)
+                                yield ChatGenerationChunk(message=message)
+                        
+                        except (json.JSONDecodeError, KeyError) as e:
+                            logger.error(f"Error parsing Groq streaming response: {e}, line: {line}")
+                            continue
+
+    def bind_tools(
+        self, tools: Sequence[Union[Dict[str, Any], Type, Callable, BaseTool]], **kwargs: Any
+    ) -> BaseChatModel:
+        """Bind tools to the model.
+        
+        This makes the tools available to the model during generation.
+        
+        Args:
+            tools: A list of tools to bind to the model.
+            **kwargs: Additional parameters to pass to the model.
             
-            # Create a proper callbacks configuration using CallbackManager
-            callbacks = None
-            if run_manager:
-                handlers = getattr(run_manager, "handlers", [])
-                callbacks = CallbackManager(handlers=handlers)
-            
-            config = RunnableConfig(callbacks=callbacks)
-            
-            # Handle tools if present
-            tools = kwargs.get("tools")
-            if tools:
-                model = groq.bind_tools(tools)
+        Returns:
+            A new instance of the model with the tools bound.
+        """
+        converted_tools = []
+        for tool in tools:
+            if isinstance(tool, dict):
+                converted_tools.append(tool)
+            elif isinstance(tool, type) and issubclass(tool, BaseModel):
+                converted_tools.append(convert_to_openai_tool(tool))
+            elif isinstance(tool, BaseTool):
+                converted_tools.append(convert_to_openai_tool(tool))
+            elif callable(tool):
+                # Handle callable tools
+                tool_name = getattr(tool, "__name__", "tool")
+                tool_description = getattr(tool, "__doc__", "A callable tool")
+                converted_tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "description": tool_description,
+                        "parameters": {
+                            "type": "object",
+                            "properties": {},
+                            "required": []
+                        }
+                    }
+                })
             else:
-                model = groq
-            
-            # Stream the response and handle BaseMessageChunk compatibility
-            for chunk in model.stream(messages, stop=stop, config=config):
-                if isinstance(chunk, AIMessage):
-                    # Create a MessageChunk compatible with ChatGenerationChunk
-                    from langchain_core.messages import AIMessageChunk
-                    content = chunk.content if isinstance(chunk.content, str) else str(chunk.content)
-                    message = AIMessageChunk(content=content)
-                    yield ChatGenerationChunk(message=message)
-                else:
-                    from langchain_core.messages import AIMessageChunk
-                    message = AIMessageChunk(content=str(chunk))
-                    yield ChatGenerationChunk(message=message)
-                    
-        except Exception as e:
-            raise ValueError(f"Error streaming with Groq: {str(e)}")
-    
-    async def _astream(
-        self,
-        messages: List[BaseMessage],
-        stop: Optional[List[str]] = None,
-        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
-        **kwargs
-    ) -> AsyncIterator[ChatGenerationChunk]:
-        """Asynchronously stream the response for the given messages."""
-        from langchain_core.outputs import ChatGenerationChunk
+                # Try to convert unknown tool types
+                try:
+                    converted_tools.append(convert_to_openai_tool(tool))
+                except Exception as e:
+                    logger.warning(f"Could not convert tool {tool}: {e}")
+                    continue
         
-        # Create a new callback manager compatible with the synchronous _stream method
-        sync_manager = None
-        if run_manager:
-            handlers = getattr(run_manager, "handlers", [])
-            # Create with proper arguments
-            sync_manager = CallbackManagerForLLMRun(
-                handlers=handlers,
-                inheritable_handlers=[],
-                parent_run_id=None, 
-                tags=getattr(run_manager, "tags", []),
-                metadata=getattr(run_manager, "metadata", {}),
-                run_id=run_manager.run_id
+        def new_generate(
+            messages: List[BaseMessage],
+            stop: Optional[List[str]] = None,
+            run_manager: Optional[CallbackManagerForLLMRun] = None,
+            **kwargs: Any,
+        ) -> ChatResult:
+            return self._generate(
+                messages=messages,
+                stop=stop,
+                run_manager=run_manager,
+                tools=converted_tools,
+                **kwargs,
             )
         
-        # Use sync streaming in an executor
-        for chunk in self._stream(
-            messages=messages,
-            stop=stop,
-            run_manager=sync_manager,
-            **kwargs
-        ):
-            yield chunk
+        def new_stream(
+            messages: List[BaseMessage],
+            stop: Optional[List[str]] = None,
+            run_manager: Optional[CallbackManagerForLLMRun] = None,
+            **kwargs: Any,
+        ) -> Iterator[ChatGenerationChunk]:
+            return self._stream(
+                messages=messages,
+                stop=stop,
+                run_manager=run_manager,
+                tools=converted_tools,
+                **kwargs,
+            )
+        
+        # Make a copy of the model to avoid modifying the original
+        model_copy = cast(ChatGroq, self.copy())
+        model_copy._generate = new_generate  # type: ignore
+        model_copy._stream = new_stream  # type: ignore
+        
+        return model_copy
 
     async def _agenerate(
         self,
         messages: List[BaseMessage],
         stop: Optional[List[str]] = None,
         run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
-        **kwargs
+        **kwargs: Any,
     ) -> ChatResult:
-        """Asynchronously generate a response from Groq."""
-        
-        # Create a new callback manager compatible with the synchronous _generate method
+        """Async generate chat completion."""
+        # Convert AsyncCallbackManagerForLLMRun to CallbackManagerForLLMRun if needed
         sync_manager = None
         if run_manager:
+            from langchain_core.callbacks.manager import CallbackManager
             handlers = getattr(run_manager, "handlers", [])
-            # Create with proper arguments
+            tags = getattr(run_manager, "tags", [])
+            metadata = getattr(run_manager, "metadata", {})
             sync_manager = CallbackManagerForLLMRun(
                 handlers=handlers,
+                tags=tags,
+                metadata=metadata,
                 inheritable_handlers=[],
-                parent_run_id=None, 
-                tags=getattr(run_manager, "tags", []),
-                metadata=getattr(run_manager, "metadata", {}),
-                run_id=run_manager.run_id
+                parent_run_id=None,
             )
-            
-        return await asyncio.get_event_loop().run_in_executor(
+        
+        # Run synchronous _generate in a thread pool
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
             None,
             lambda: self._generate(
                 messages=messages,
@@ -247,158 +424,36 @@ class ChatGroq(BaseChatModel):
             )
         )
 
-    def _generate(
+    async def _astream(
         self,
         messages: List[BaseMessage],
         stop: Optional[List[str]] = None,
-        run_manager: Optional[CallbackManagerForLLMRun] = None,
-        **kwargs
-    ) -> ChatResult:
-        """Generate a response from Groq."""
-        tools = kwargs.pop("tools", None)
-        if tools and isinstance(tools, list):
-            # Use tool invocation path
-            try:
-                result = self._invoke_tools(messages, tools, run_manager=run_manager, **kwargs)
-                # Convert to ChatResult for compatibility
-                return ChatResult(generations=[ChatGeneration(message=result)])
-            except Exception as e:
-                raise ValueError(f"Error invoking Groq tools: {str(e)}")
-        else:
-            # Regular chat completion path
-            try:
-                from langchain_groq import ChatGroq as LangchainGroq
-                from langchain_core.callbacks.manager import CallbackManager
-                
-                # Collect parameters
-                params = {
-                    "temperature": kwargs.get("temperature", self.temperature),
-                    "top_p": kwargs.get("top_p", self.top_p),
-                    "max_tokens": kwargs.get("max_tokens", self.max_tokens)
-                }
-                
-                # Convert SecretStr to string
-                api_key_value = self.api_key.get_secret_value() if self.api_key else None
-                
-                # Create a new instance passing the raw string value
-                groq = LangchainGroq(
-                    api_key=api_key_value,  # Pass the raw string, not wrapped in SecretStr
-                    model=self.model,
-                    **{k: v for k, v in params.items() if v is not None}
-                )
-                
-                # Create a proper callbacks configuration using CallbackManager
-                callbacks = None
-                if run_manager:
-                    handlers = getattr(run_manager, "handlers", [])
-                    callbacks = CallbackManager(handlers=handlers)
-                
-                config = RunnableConfig(callbacks=callbacks)
-                result = groq.invoke(messages, config=config, stop=stop)
-                
-                # Convert to ChatResult for compatibility
-                if isinstance(result, AIMessage):
-                    return ChatResult(generations=[ChatGeneration(message=result)])
-                else:
-                    return ChatResult(generations=[ChatGeneration(message=AIMessage(content=str(result)))])
-                    
-            except Exception as e:
-                raise ValueError(f"Error generating with Groq: {str(e)}")
-    
-    def bind_tools(
-        self, 
-        tools: Sequence[Union[Dict[str, Any], Type, Callable, BaseTool]],
-        *,
-        tool_choice: Optional[Union[str, Dict[str, str]]] = None,
-        **kwargs
-    ) -> BaseChatModel:
-        """Bind tools to the model."""
-        from langchain_core.tools import BaseTool
-        
-        # Process tools to ensure they're in the right format
-        processed_tools = []
-        for tool in tools:
-            if isinstance(tool, dict):
-                # Assume the dictionary is already in the right format
-                processed_tools.append(tool)
-            elif isinstance(tool, BaseTool):
-                # Create a tool dictionary with required fields
-                tool_dict = {}
-                # Set name and description
-                tool_dict["name"] = tool.name
-                tool_dict["description"] = tool.description
-                
-                # Handle the args_schema carefully
-                if hasattr(tool, "args_schema") and tool.args_schema is not None:
-                    args_schema = tool.args_schema
-                    
-                    # Check if args_schema has a schema method
-                    schema_method = getattr(args_schema, "schema", None)
-                    if schema_method is not None and callable(schema_method):
-                        # Use schema method if available
-                        try:
-                            tool_dict["parameters"] = schema_method()
-                        except Exception:
-                            # Fall back to __dict__ if schema() fails
-                            try:
-                                tool_dict["parameters"] = args_schema.__dict__
-                            except AttributeError:
-                                tool_dict["parameters"] = {}
-                    # Check if args_schema is already a dict
-                    elif isinstance(args_schema, dict):
-                        tool_dict["parameters"] = args_schema.copy()
-                    # Try __dict__ as last resort
-                    else:
-                        try:
-                            tool_dict["parameters"] = args_schema.__dict__
-                        except AttributeError:
-                            tool_dict["parameters"] = {}
-                            
-                processed_tools.append(tool_dict)
-            elif callable(tool):
-                # Convert callable to a dictionary (best effort)
-                import inspect
-                signature = inspect.signature(tool)
-                name = tool.__name__
-                description = tool.__doc__ or f"Function {name}"
-                parameters = {}
-                for param_name, param in signature.parameters.items():
-                    parameters[param_name] = {
-                        "type": "string",
-                        "description": f"Parameter {param_name}"
-                    }
-                
-                tool_dict = {
-                    "name": name,
-                    "description": description,
-                    "parameters": {
-                        "type": "object",
-                        "properties": parameters,
-                        "required": list(parameters.keys())
-                    }
-                }
-                processed_tools.append(tool_dict)
-        
-        # Create a new instance with the tools bound
-        chat_model = deepcopy(self)
-        
-        # This gets passed to _generate via **kwargs
-        def _generate_with_tools(
-            self,
-            messages: List[BaseMessage],
-            stop: Optional[List[str]] = None,
-            run_manager: Optional[CallbackManagerForLLMRun] = None,
-            **kwargs
-        ) -> ChatResult:
-            return self._generate(
-                messages=messages,
-                stop=stop,
-                run_manager=run_manager,
-                tools=processed_tools,
-                tool_choice=tool_choice,
-                **kwargs
+        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[ChatGenerationChunk]:
+        """Async stream chat completion."""
+        # Convert AsyncCallbackManagerForLLMRun to CallbackManagerForLLMRun if needed
+        sync_manager = None
+        if run_manager:
+            from langchain_core.callbacks.manager import CallbackManager
+            handlers = getattr(run_manager, "handlers", [])
+            tags = getattr(run_manager, "tags", [])
+            metadata = getattr(run_manager, "metadata", {})
+            sync_manager = CallbackManagerForLLMRun(
+                handlers=handlers,
+                tags=tags,
+                metadata=metadata,
+                inheritable_handlers=[],
+                parent_run_id=None,
             )
+            
+        # Convert synchronous iterator to async iterator
+        iterator = self._stream(
+            messages=messages,
+            stop=stop,
+            run_manager=sync_manager,
+            **kwargs
+        )
         
-        # Override _generate with our wrapped version
-        chat_model._generate = _generate_with_tools.__get__(chat_model)
-        return chat_model
+        for chunk in iterator:
+            yield chunk

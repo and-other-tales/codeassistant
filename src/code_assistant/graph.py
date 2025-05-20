@@ -1,6 +1,6 @@
 """Main entrypoint for the code assistant graph."""
 
-from typing import Dict, List, Optional, Sequence, cast
+from typing import Dict, List, Optional, Sequence, cast, Any
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
@@ -64,6 +64,7 @@ async def generate_code(
     user_text = get_message_text(messages[-1])
     formatted_docs = format_docs(state.get_documents())
     configuration = cast(Configuration, config.get("configurable", {}))
+    missing_modules = []  # Initialize with empty list to avoid "possibly unbound" error
 
     # Check for ingestion requests
     if "ingest" in user_text.lower() and "github" in user_text.lower():
@@ -77,7 +78,13 @@ async def generate_code(
         model_with_tools = model.bind_tools(all_tools)
         
         try:
-            result = model_with_tools.invoke(messages)
+            # Enable streaming in the config
+            stream_config = dict(config)  # Create a copy of the config
+            stream_config["callbacks"] = config.get("callbacks", [])
+            stream_config["stream"] = True
+            
+            # Stream the response
+            result = await model_with_tools.ainvoke(messages, config=cast(RunnableConfig, stream_config))
             tool_calls = extract_tool_calls(result)
             
             for tool_call in tool_calls:
@@ -146,6 +153,17 @@ async def generate_code(
                 msg = f"Successfully ingested documentation for: {', '.join(ingestion_results.keys())}"
                 messages.append(AIMessage(content=msg))
     
+    # Save this information in memory for future reference
+    state.add_to_memory(
+        key=f"modules_check_{iterations}",
+        value={
+            "required_modules": required_modules,
+            "missing_modules": missing_modules,
+            "timestamp": __import__('datetime').datetime.now().isoformat()
+        },
+        metadata={"type": "module_check"}
+    )
+    
     # Proceed with code generation with validated knowledge
     github_tools = get_github_tools(user_consent=True)
     all_tools = build_agent_tools(
@@ -169,7 +187,67 @@ async def generate_code(
         ])
 
         message_value = prompt.format_messages(messages=messages, context=formatted_docs)
-        result = model_with_tools.invoke(message_value)
+        
+        # Set up streaming configuration
+        stream_config = dict(config)  # Create a copy of the config
+        stream_config["callbacks"] = config.get("callbacks", [])
+        stream_config["stream"] = True
+        
+        # Use astream_events for more granular streaming
+        event_generator = model_with_tools.astream_events(
+            message_value,
+            config=cast(RunnableConfig, stream_config),
+            version="v1"
+        )
+        
+        # Process events
+        result = None
+        async for event in event_generator:
+            if event["event"] == "on_chat_model_stream":
+                # Process streaming tokens if needed
+                pass
+            elif event["event"] == "on_chat_model_end":
+                # Safe access to the messages - different models might return different structures
+                if "data" in event and isinstance(event["data"], dict):
+                    if "messages" in event["data"] and len(event["data"]["messages"]) > 0:
+                        result = event["data"]["messages"][0]
+                    elif "message" in event["data"]:
+                        result = event["data"]["message"]
+        
+        # If we didn't get a result from streaming, fall back to normal invocation
+        if result is None:
+            result = await model_with_tools.ainvoke(message_value, config=config)
+        
+        # Verify the generated code if it exists
+        # This is a basic verification - expanded quality gates would be implemented here
+        if result and hasattr(result, "content"):
+            code_content = str(result.content)  # Convert content to string to ensure it's processable
+            
+            # Extract code blocks
+            import re
+            code_blocks = re.findall(r"```(?:python)?\s*(.*?)```", code_content, re.DOTALL)
+            
+            if code_blocks:
+                # Check imports and code execution
+                execution_result = await check_code_execution(code_blocks[0])
+                
+                # Store verification results in memory
+                state.add_to_memory(
+                    key=f"code_verification_{iterations}",
+                    value={
+                        "execution_result": execution_result,
+                        "timestamp": __import__('datetime').datetime.now().isoformat()
+                    },
+                    metadata={"type": "code_verification"}
+                )
+                
+                # If verification fails, append message about the issues
+                if not execution_result.get("success", False):
+                    error_msg = "Code verification failed:\n"
+                    error_msg += f"- {execution_result.get('description', 'Unknown error')}\n"
+                    
+                    messages.append(AIMessage(content=error_msg))
+                    # We don't return here to allow the code to be returned with the errors
         
         # Extract any tool calls
         tool_calls = extract_tool_calls(result)
@@ -188,6 +266,10 @@ async def generate_code(
                 # Handle the result which may be a boolean or a dictionary
                 status_message = "successful" if ingestion_result == True or (isinstance(ingestion_result, dict) and ingestion_result.get('status') == 'success') else "failed"
                 messages.append(AIMessage(content=f"Additional repo ingestion result: {status_message}"))
+        
+        # Manage conversation history to prevent context window issues
+        state.trim_messages(max_count=15)  # Keep only the last 15 messages
+        state.update_conversation_summary()  # Update the conversation summary
         
         # Return the final result
         return {

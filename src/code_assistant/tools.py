@@ -17,7 +17,16 @@ Functions:
 import os
 import re
 import json
-from typing import Dict, List, Optional, Any, Union
+from typing import Dict, List, Optional, Any, Union, Type, Sequence
+import traceback
+from pydantic import BaseModel
+
+# Define ToolException locally to avoid import issues
+class ToolException(Exception):
+    """Exception raised by tool execution."""
+    def __init__(self, message: str, recoverable: bool = False):
+        super().__init__(message)
+        self.recoverable = recoverable
 
 from langchain_core.messages import BaseMessage
 from langchain_core.tools import BaseTool
@@ -155,31 +164,40 @@ async def check_and_ingest_missing_modules(required_modules: list[str], mongodb_
     return results
 
 
-def extract_tool_calls(model_output: BaseMessage) -> List[Dict]:
-    """Extract tool calls from a message.
+def extract_tool_calls(response: Any) -> List[Dict[str, Any]]:
+    """Extract tool calls from the model response.
     
     Args:
-        model_output (BaseMessage): The message containing tool calls.
+        response (Any): The model response.
         
     Returns:
-        List[Dict]: A list of tool calls.
+        List[Dict[str, Any]]: List of tool calls.
     """
-    return getattr(model_output, "tool_calls", [])
+    if hasattr(response, "tool_calls") and response.tool_calls:
+        return response.tool_calls
+    elif hasattr(response, "additional_kwargs") and "tool_calls" in response.additional_kwargs:
+        return response.additional_kwargs["tool_calls"]
+    return []
 
 
-def format_tool_call(tool_call: Dict) -> Dict:
-    """Format a tool call for execution.
+def format_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
+    """Format tool call for execution.
     
     Args:
-        tool_call (Dict): The raw tool call.
+        tool_call (Dict[str, Any]): The tool call to format.
         
     Returns:
-        Dict: Formatted tool call.
+        Dict[str, Any]: Formatted tool call.
     """
-    return {
-        "name": tool_call.get("name", ""),
-        "arguments": json.loads(tool_call.get("args", "{}")),
-    }
+    if "function" in tool_call:
+        # Handle OpenAI-style tool calls
+        function = tool_call["function"]
+        return {
+            "name": function.get("name", ""),
+            "arguments": json.loads(function.get("arguments", "{}")),
+        }
+    # Return as-is for other formats
+    return tool_call
 
 
 def get_github_tools(user_consent: bool = False):
@@ -278,3 +296,121 @@ def build_agent_tools(user_tools: list, github_tools: list | None = None, ingest
                 all_tools.append(tool_cls)
     
     return all_tools
+
+
+async def handle_tool_error(tool_name: str, error: Exception, retry_handler=None) -> Dict[str, Any]:
+    """Handle errors from tool execution in a standardized way.
+    
+    Args:
+        tool_name (str): The name of the tool that encountered an error
+        error (Exception): The exception that occurred
+        retry_handler (callable, optional): Function to handle retries
+        
+    Returns:
+        Dict[str, Any]: Standardized error response
+    """
+    error_trace = traceback.format_exc()
+    error_message = str(error)
+    
+    # Log the error for debugging
+    print(f"Error in tool {tool_name}: {error_message}")
+    print(f"Traceback: {error_trace}")
+    
+    # If we have a retry handler, try to use it
+    if retry_handler and callable(retry_handler):
+        try:
+            return await retry_handler(tool_name, error)
+        except Exception as retry_error:
+            # If retry also fails, continue with normal error handling
+            print(f"Retry handling failed: {str(retry_error)}")
+    
+    # Construct a standardized error response
+    error_response = {
+        "status": "error",
+        "tool": tool_name,
+        "error_type": type(error).__name__,
+        "message": error_message,
+        "recoverable": isinstance(error, ToolException) and getattr(error, "recoverable", False)
+    }
+    
+    return error_response
+
+
+async def safe_tool_call(tool_func, tool_name: str, **kwargs) -> Dict[str, Any]:
+    """Safely execute a tool call with standardized error handling.
+    
+    Args:
+        tool_func (callable): The tool function to call
+        tool_name (str): The name of the tool
+        **kwargs: Arguments to pass to the tool function
+        
+    Returns:
+        Dict[str, Any]: Tool result or error response
+    """
+    try:
+        result = await tool_func(**kwargs)
+        return {
+            "status": "success",
+            "tool": tool_name,
+            "result": result
+        }
+    except Exception as e:
+        return await handle_tool_error(tool_name, e)
+
+
+class ToolCallResult:
+    """Class to represent the result of a tool call with improved error handling."""
+    
+    def __init__(self, success: bool, tool_name: str, result: Any = None, error: Optional[Exception] = None):
+        """Initialize the tool call result.
+        
+        Args:
+            success (bool): Whether the tool call was successful
+            tool_name (str): The name of the tool
+            result (Any, optional): The result if successful
+            error (Optional[Exception], optional): The error if not successful
+        """
+        self.success = success
+        self.tool_name = tool_name
+        self.result = result
+        self.error = error
+        
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to a dictionary representation.
+        
+        Returns:
+            Dict[str, Any]: Dictionary representation of the result
+        """
+        if self.success:
+            return {
+                "status": "success",
+                "tool": self.tool_name,
+                "result": self.result
+            }
+        else:
+            return {
+                "status": "error",
+                "tool": self.tool_name,
+                "error_type": type(self.error).__name__ if self.error else "UnknownError",
+                "message": str(self.error) if self.error else "Unknown error",
+                "recoverable": isinstance(self.error, ToolException) and getattr(self.error, "recoverable", False)
+            }
+            
+
+class RetryableToolException(ToolException):
+    """A tool exception that can be retried.
+    
+    This exception indicates that the tool execution failed but the operation
+    can be retried, potentially with different parameters or after some time.
+    """
+    
+    def __init__(self, message: str, retry_after_seconds: Optional[int] = None):
+        """Initialize the retryable tool exception.
+        
+        Args:
+            message (str): The error message
+            retry_after_seconds (Optional[int], optional): Suggested wait time before retrying
+        """
+        super().__init__(message)
+        self.recoverable = True
+        self.retry_after_seconds = retry_after_seconds
