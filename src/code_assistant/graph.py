@@ -114,31 +114,31 @@ async def generate_code(
         messages = list(messages) + [AIMessage(content=brainstorm_msg)]
         return {"messages": messages, "iterations": iterations, "error": "", "generation": None}
 
-    # --- Pre-codegen documentation check ---
+    # --- Always ingest langchain-sandbox and langgraph-codeact ---
     mongodb_uri = configuration.mongodb_uri
-    # Extract required modules from user request
+    pinecone_index = configuration.pinecone_index
+    pinecone_api_key = configuration.pinecone_api_key
+    embedding_model_name = getattr(configuration, 'embedding_model_name', 'openai/text-embedding-3-small')
+    sandbox_result = ingest_github_repo(
+        repo_url="https://github.com/langchain-ai/langchain-sandbox",
+        mongodb_uri=mongodb_uri,
+        pinecone_index=pinecone_index,
+        pinecone_api_key=pinecone_api_key,
+        embedding_model_name=embedding_model_name
+    )
+    codeact_result = ingest_github_repo(
+        repo_url="https://github.com/langchain-ai/langgraph-codeact",
+        mongodb_uri=mongodb_uri,
+        pinecone_index=pinecone_index,
+        pinecone_api_key=pinecone_api_key,
+        embedding_model_name=embedding_model_name
+    )
+    if sandbox_result.get("status") != "success" or codeact_result.get("status") != "success":
+        messages = list(messages) + [AIMessage(content=f"Failed to ingest required sandbox/codeact modules: sandbox={sandbox_result}, codeact={codeact_result}")]
+        return {"messages": messages, "iterations": iterations, "error": "Sandbox/codeact ingestion failed.", "generation": None}
+
+    # --- Pre-codegen documentation check ---
     required_modules = extract_required_modules(user_text)
-    missing_modules = [m for m in required_modules if not documentation_exists(m, mongodb_uri)]
-    if missing_modules:
-        # Attempt to ingest missing modules from GitHub (assume repo URL is github.com/{module}/{module})
-        ingestion_results = []
-        for module in missing_modules:
-            repo_url = f"https://github.com/{module}/{module}"
-            pinecone_index = configuration.pinecone_index
-            pinecone_api_key = configuration.pinecone_api_key
-            embedding_model_name = getattr(configuration, 'embedding_model_name', 'openai/text-embedding-3-small')
-            result = ingest_github_repo(
-                repo_url=repo_url,
-                mongodb_uri=mongodb_uri,
-                pinecone_index=pinecone_index,
-                pinecone_api_key=pinecone_api_key,
-                embedding_model_name=embedding_model_name
-            )
-            ingestion_results.append((module, result))
-        # Inform user and halt codegen until docs are present
-        msg = "Some required modules were missing documentation. Ingestion attempted for: "
-        msg += ", ".join([f"{m} (status: {r['status']})" for m, r in ingestion_results])
-        messages = list(messages) + [AIMessage(content=msg)]
         return {"messages": messages, "iterations": iterations, "error": "Missing documentation for required modules.", "generation": None}
 
     # --- Ingestion tool logic ---

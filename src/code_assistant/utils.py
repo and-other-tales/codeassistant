@@ -371,3 +371,92 @@ def documentation_exists(module: str, mongodb_uri: str) -> bool:
         ]
     })
     return doc is not None
+
+
+def fetch_and_ingest_langchain_repos(mongodb_uri: str, pinecone_index: str, pinecone_api_key: str, embedding_model_name: str = "openai/text-embedding-3-small") -> dict:
+    """
+    Fetches and ingests documentation and examples from:
+    - https://github.com/langchain-ai/langchain-sandbox
+    - https://github.com/langchain-ai/langgraph-codeact
+    Returns a dict with ingestion results for both repos.
+    """
+    from code_assistant.utils import ingest_github_repo
+    repos = [
+        "https://github.com/langchain-ai/langchain-sandbox",
+        "https://github.com/langchain-ai/langgraph-codeact"
+    ]
+    results = {}
+    for repo_url in repos:
+        result = ingest_github_repo(
+            repo_url=repo_url,
+            mongodb_uri=mongodb_uri,
+            pinecone_index=pinecone_index,
+            pinecone_api_key=pinecone_api_key,
+            embedding_model_name=embedding_model_name
+        )
+        results[repo_url] = result
+    return results
+
+
+# --- SANDBOXED CODE EXECUTION ---
+
+def run_code_in_pyodide_sandbox(code: str, allow_net: bool = False):
+    """
+    Executes code in a PyodideSandbox (langchain-sandbox) for secure, isolated execution.
+    Returns the CodeExecutionResult object.
+
+    NOTE: langchain-sandbox requires langgraph<0.4.0, which may conflict with your main project.
+    If ImportError occurs, run this in a separate virtual environment or subprocess.
+    """
+    try:
+        from langchain_sandbox import PyodideSandbox
+        import asyncio
+        import tempfile
+        import shutil
+    except ImportError as e:
+        raise ImportError("langchain-sandbox is not installed or incompatible with current langgraph version. "
+                          "Use a separate environment for sandboxed execution.\n" + str(e))
+    sessions_dir = tempfile.mkdtemp()
+    try:
+        sandbox = PyodideSandbox(sessions_dir=sessions_dir, allow_net=allow_net)
+        async def _run():
+            return await sandbox.execute(code)
+        return asyncio.run(_run())
+    finally:
+        shutil.rmtree(sessions_dir, ignore_errors=True)
+
+# --- CODEACT AGENT INTEGRATION ---
+
+def create_codeact_agent(model, tools, allow_net: bool = False):
+    """
+    Creates a CodeAct agent using PyodideSandbox for secure code execution.
+
+    NOTE: langgraph-codeact requires langgraph<0.4.0, which may conflict with your main project.
+    If ImportError occurs, run this in a separate virtual environment or subprocess.
+    """
+    try:
+        from langgraph_codeact import create_codeact
+        from langgraph.checkpoint.memory import MemorySaver
+    except ImportError as e:
+        raise ImportError("langgraph-codeact is not installed or incompatible with current langgraph version. "
+                          "Use a separate environment for codeact agent execution.\n" + str(e))
+    def pyodide_sandbox_eval(code: str, _locals: dict):
+        result = run_code_in_pyodide_sandbox(code, allow_net=allow_net)
+        return result.stdout or result.result, _locals
+    code_act = create_codeact(model, tools, pyodide_sandbox_eval)
+    agent = code_act.compile(checkpointer=MemorySaver())
+    return agent
+
+# --- EXAMPLE TEST TEMPLATE ---
+
+def test_generated_code_with_codeact(model, tools, code: str, expected_output: str):
+    """
+    Test generated code using CodeAct agent and PyodideSandbox for correctness and safety.
+    This function will raise ImportError if dependencies are not compatible.
+    """
+    agent = create_codeact_agent(model, tools)
+    messages = [{"role": "user", "content": code}]
+    result = agent.invoke({"messages": messages})
+    # result is typically a list of message dicts; check all for expected output
+    found = any(expected_output in (msg.get("content", "") or str(msg)) for msg in (result if isinstance(result, list) else [result]))
+    assert found, f"Expected output not found. Got: {result}"
