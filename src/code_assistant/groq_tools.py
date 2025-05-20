@@ -91,9 +91,9 @@ class ChatGroq(BaseChatModel):
             # Convert SecretStr to string for the API
             api_key_value = self.api_key.get_secret_value() if self.api_key else None
             
-            # Pass api_key_value directly - langchain_groq will handle SecretStr conversion
+            # Create an instance passing the raw string value
             groq = LangchainGroq(
-                api_key=api_key_value,
+                api_key=api_key_value,  # Pass the raw string, not wrapped in SecretStr
                 model=self.model,
                 **{k: v for k, v in params.items() if v is not None}
             )
@@ -142,9 +142,9 @@ class ChatGroq(BaseChatModel):
             # Convert SecretStr to string
             api_key_value = self.api_key.get_secret_value() if self.api_key else None
             
-            # Create the model - pass api_key_value directly
+            # Create the model passing the raw string value
             groq = LangchainGroq(
-                api_key=api_key_value,
+                api_key=api_key_value,  # Pass the raw string, not wrapped in SecretStr
                 model=self.model,
                 streaming=True,
                 **{k: v for k, v in params.items() if v is not None}
@@ -277,12 +277,12 @@ class ChatGroq(BaseChatModel):
                     "max_tokens": kwargs.get("max_tokens", self.max_tokens)
                 }
                 
-                # Convert SecretStr to string for the API
+                # Convert SecretStr to string
                 api_key_value = self.api_key.get_secret_value() if self.api_key else None
                 
-                # Pass api_key_value directly
+                # Create a new instance passing the raw string value
                 groq = LangchainGroq(
-                    api_key=api_key_value,
+                    api_key=api_key_value,  # Pass the raw string, not wrapped in SecretStr
                     model=self.model,
                     **{k: v for k, v in params.items() if v is not None}
                 )
@@ -331,29 +331,27 @@ class ChatGroq(BaseChatModel):
                 # Handle the args_schema carefully
                 if hasattr(tool, "args_schema") and tool.args_schema is not None:
                     args_schema = tool.args_schema
-                    # Check if it has a schema method
-                    if hasattr(args_schema, "schema") and callable(getattr(args_schema, "schema")):
-                        # Convert schema to a dictionary - handle this with try/except
+                    
+                    # Check if args_schema has a schema method
+                    schema_method = getattr(args_schema, "schema", None)
+                    if schema_method is not None and callable(schema_method):
+                        # Use schema method if available
                         try:
-                            schema_dict = args_schema.schema()
-                            tool_dict["parameters"] = schema_dict
+                            tool_dict["parameters"] = schema_method()
                         except Exception:
-                            # Fallback if schema() method fails or doesn't exist
+                            # Fall back to __dict__ if schema() fails
                             try:
-                                # Try to convert to a dict using __dict__
                                 tool_dict["parameters"] = args_schema.__dict__
                             except AttributeError:
-                                # Final fallback
                                 tool_dict["parameters"] = {}
+                    # Check if args_schema is already a dict
                     elif isinstance(args_schema, dict):
-                        # If it's already a dict, use it directly
-                        tool_dict["parameters"] = args_schema
+                        tool_dict["parameters"] = args_schema.copy()
+                    # Try __dict__ as last resort
                     else:
-                        # Try to convert to a dict using __dict__
                         try:
                             tool_dict["parameters"] = args_schema.__dict__
                         except AttributeError:
-                            # Fallback
                             tool_dict["parameters"] = {}
                             
                 processed_tools.append(tool_dict)
