@@ -22,6 +22,8 @@ from langchain_core.embeddings import Embeddings
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AnyMessage
 from langchain_core.vectorstores import VectorStoreRetriever
+from langchain_groq import ChatGroq
+from pydantic import SecretStr
 
 
 def get_message_text(msg: AnyMessage) -> str:
@@ -106,17 +108,26 @@ def format_docs(docs: Optional[Sequence[Document]]) -> str:
 
 
 def load_chat_model(fully_specified_name: str) -> BaseChatModel:
-    """Load a chat model from a fully specified name.
-
-    Args:
-        fully_specified_name (str): String in the format 'provider/model'.
-    """
+    """Load a chat model from a fully specified name, including Groq support."""
     if "/" in fully_specified_name:
         provider, model = fully_specified_name.split("/", maxsplit=1)
     else:
         provider = ""
         model = fully_specified_name
-    return init_chat_model(model, model_provider=provider)
+
+    if provider == "groq":
+        # Support for ChatGroq
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            raise ValueError("GROQ_API_KEY environment variable must be set for Groq models.")
+        return ChatGroq(model=model, api_key=SecretStr(api_key))
+    elif provider == "openai":
+        return init_chat_model(model, model_provider="openai")
+    elif provider == "anthropic":
+        return init_chat_model(model, model_provider="anthropic")
+    else:
+        # If provider is not recognized, try passing the full name (for future compatibility)
+        return init_chat_model(fully_specified_name)
 
 
 def check_imports(imports: str) -> tuple[bool, Optional[str]]:
@@ -192,7 +203,12 @@ def make_text_encoder(model: str) -> Embeddings:
             return OpenAIEmbeddings(model=model)
         case "cohere":
             from langchain_cohere import CohereEmbeddings
-            return CohereEmbeddings(model=model)
+            import cohere
+            cohere_api_key = os.environ.get("COHERE_API_KEY")
+            if not cohere_api_key:
+                raise ValueError("COHERE_API_KEY environment variable must be set for Cohere embeddings.")
+            client = cohere.Client(cohere_api_key)
+            return CohereEmbeddings(model=model, client=client, async_client=None)
         case _:
             raise ValueError(f"Unsupported embedding provider: {provider}")
 
@@ -200,7 +216,7 @@ def make_text_encoder(model: str) -> Embeddings:
 def make_pinecone_retriever(
     user_id: str, 
     embedding_model: Embeddings,
-    search_kwargs: dict[str, Any] = None
+    search_kwargs: Optional[dict[str, Any]] = None
 ) -> VectorStoreRetriever:
     """Configure a Pinecone retriever.
     
@@ -228,7 +244,7 @@ def make_pinecone_retriever(
 def make_mongodb_retriever(
     user_id: str, 
     embedding_model: Embeddings,
-    search_kwargs: dict[str, Any] = None
+    search_kwargs: Optional[dict[str, Any]] = None
 ) -> VectorStoreRetriever:
     """Configure a MongoDB Atlas retriever.
     
@@ -241,15 +257,29 @@ def make_mongodb_retriever(
         VectorStoreRetriever: The configured retriever.
     """
     from langchain_mongodb.vectorstores import MongoDBAtlasVectorSearch
-    
     search_kwargs = search_kwargs or {}
-    
     pre_filter = search_kwargs.setdefault("pre_filter", {})
     pre_filter["user_id"] = {"$eq": user_id}
-    
     vstore = MongoDBAtlasVectorSearch.from_connection_string(
         os.environ["MONGODB_URI"],
         namespace="code_assistant.documentation",
         embedding=embedding_model,
     )
     return vstore.as_retriever(search_kwargs=search_kwargs)
+
+
+def get_document_from_mongodb(doc_id: str):
+    """Fetch a document from MongoDB by its ID. Returns a langchain Document or None."""
+    import os
+    from pymongo import MongoClient
+    from langchain_core.documents import Document
+    MONGODB_URI = os.environ.get("MONGODB_URI")
+    if not MONGODB_URI:
+        return None
+    client = MongoClient(MONGODB_URI)
+    db = client["codeassist"]  # Specify the database name
+    collection = db["docs"]  # Specify the collection name
+    doc = collection.find_one({"_id": doc_id})
+    if not doc:
+        return None
+    return Document(page_content=doc.get("page_content", ""), metadata=doc.get("metadata", {}))

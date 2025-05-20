@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
 from typing import Annotated, Any, Literal, Optional, Type, TypeVar
+import os
 
 from langchain_core.runnables import RunnableConfig, ensure_config
 
@@ -86,9 +87,9 @@ class Configuration(DocumentConfiguration):
     )
 
     code_gen_model: Annotated[str, {"__template_metadata__": {"kind": "llm"}}] = field(
-        default="anthropic/claude-3-opus-20240229",
+        default_factory=lambda: os.getenv("CODE_GEN_MODEL", "anthropic/claude-3-opus-20240229"),
         metadata={
-            "description": "The language model used for generating code. Should be in the form: provider/model-name."
+            "description": "The language model used for generating code. Should be in the form: provider/model-name. Can be overridden with CODE_GEN_MODEL env variable."
         },
     )
 
@@ -101,9 +102,9 @@ class Configuration(DocumentConfiguration):
     )
 
     reflection_model: Annotated[str, {"__template_metadata__": {"kind": "llm"}}] = field(
-        default="anthropic/claude-3-haiku-20240307",
+        default_factory=lambda: os.getenv("REFLECTION_MODEL", "anthropic/claude-3-haiku-20240307"),
         metadata={
-            "description": "The language model used for reflection. Should be in the form: provider/model-name."
+            "description": "The language model used for reflection. Should be in the form: provider/model-name. Can be overridden with REFLECTION_MODEL env variable."
         },
     )
 

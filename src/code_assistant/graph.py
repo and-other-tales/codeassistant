@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, cast
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.pydantic_v1 import BaseModel
+from pydantic import BaseModel
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, StateGraph, START
 
@@ -52,14 +52,19 @@ async def process_documentation(
     # If we already have documentation, use it
     if state.documentation:
         return {"documents": state.documentation}
-    
+
+    # If a MongoDB document ID/reference is present in the state, fetch from MongoDB
+    doc_id = getattr(state, 'mongodb_doc_id', None)
+    if doc_id:
+        from code_assistant.utils import get_document_from_mongodb
+        mongo_doc = get_document_from_mongodb(doc_id)
+        if mongo_doc:
+            return {"documents": [mongo_doc]}
+
     # Extract documentation from the latest message
     user_input = get_message_text(messages[-1])
-    
     # For now, we'll just create a document from the user input
-    # In a real application, you would parse URLs, file paths, etc.
     from langchain_core.documents import Document
-    
     doc = Document(page_content=user_input)
     return {"documents": [doc]}
 
@@ -93,15 +98,30 @@ async def generate_code(
     # Format documentation
     formatted_docs = format_docs(documents)
     
+    # Detect if the user is just greeting or starting a chat
+    user_text = get_message_text(messages[-1]).strip().lower()
+    greeting_phrases = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]
+    if any(user_text.startswith(greet) for greet in greeting_phrases):
+        # Respond with a natural language introduction
+        intro = (
+            "Hello! I'm your code assistant. "
+            "You can ask me to generate code, ingest documentation, or help with your coding tasks. "
+            "For example, you can say: 'Please ingest the GitHub repository at ...', "
+            "or 'I'd like you to create a FastAPI endpoint.'\n\nHow can I help you today?"
+        )
+        # Use AIMessage for consistency with message types
+        messages = list(messages) + [AIMessage(content=intro)]
+        # Set special error flag to end the graph after intro
+        return {"messages": messages, "iterations": iterations, "error": "__intro__", "generation": None}
+    
     # If we have an error, prepare to regenerate with error info
-    if error:
-        messages += [
-            (
-                "user",
+    if error and error != "__intro__":
+        messages = list(messages) + [
+            AIMessage(content=(
                 f"Your solution failed with the following error: {error}. "
                 "Please fix the issues and provide a corrected solution. "
-                "Make sure to invoke the code tool to structure your output correctly.",
-            )
+                "Make sure to invoke the code tool to structure your output correctly."
+            ))
         ]
     
     # Prepare prompt and model
@@ -130,16 +150,17 @@ async def generate_code(
     raw_result = await structured_model.ainvoke(message_value, config)
     
     # Handle potential tool invocation failures (Claude sometimes struggles with tool use)
-    if raw_result.get("parsing_error"):
+    parsing_error = getattr(raw_result, 'parsing_error', None)
+    if parsing_error:
         # Fallback to retry with stronger tool use instruction
         fallback_messages = list(messages)
+        raw_content = getattr(getattr(raw_result, 'raw', None), 'content', '')
         fallback_messages.append(
-            AIMessage(content=f"I'll help create code based on the documentation. {raw_result['raw'].content}")
+            AIMessage(content=f"I'll help create code based on the documentation. {raw_content}")
         )
         fallback_messages.append(
             AIMessage(content="Please try again, and make sure to invoke the 'code' tool to structure your response with prefix, imports, and code fields.")
         )
-        
         # Try again with the fallback model
         message_value = await prompt.ainvoke(
             {
@@ -148,57 +169,43 @@ async def generate_code(
             },
             config,
         )
-        
         raw_result = await structured_model.ainvoke(message_value, config)
-        
-        # If still failing, create a basic structure
-        if raw_result.get("parsing_error"):
+        parsing_error = getattr(raw_result, 'parsing_error', None)
+        if parsing_error:
             print("---TOOL PARSING FAILED, USING FALLBACK EXTRACTION---")
-            raw_content = raw_result["raw"].content
-            
-            # Simple extraction logic - would be more robust in production
+            raw_content = getattr(getattr(raw_result, 'raw', None), 'content', '')
             import re
-            
             prefix_match = re.search(r"(.*?)(?=```|Imports:|imports:)", raw_content, re.DOTALL)
             prefix = prefix_match.group(1).strip() if prefix_match else "Code solution generated"
-            
             imports_match = re.search(r"(?:Imports:|imports:)(.*?)(?=```|Code:|code:)", raw_content, re.DOTALL)
             imports = imports_match.group(1).strip() if imports_match else ""
-            
             code_match = re.search(r"```(?:python)?\s*(.*?)```", raw_content, re.DOTALL)
             code = code_match.group(1).strip() if code_match else ""
-            
             code_solution = CodeSolution(
                 prefix=prefix,
                 imports=imports,
                 code=code
             )
         else:
-            code_solution = cast(CodeSolution, raw_result["parsed"])
+            code_solution = getattr(raw_result, 'parsed', None)
     else:
-        code_solution = cast(CodeSolution, raw_result["parsed"])
+        code_solution = getattr(raw_result, 'parsed', None)
     
-    # Append solution to messages
-    formatted_solution = (
-        f"{code_solution.prefix} \n\nImports:\n```python\n{code_solution.imports}\n```"
-        f"\n\nCode:\n```python\n{code_solution.code}\n```"
-    )
-    
-    messages += [
-        (
-            "assistant",
-            formatted_solution,
+    # Append solution to messages only if a solution exists
+    if code_solution:
+        formatted_solution = (
+            f"{code_solution.prefix} \n\nImports:\n```python\n{code_solution.imports}\n```"
+            f"\n\nCode:\n```python\n{code_solution.code}\n```"
         )
-    ]
-    
-    # Increment iterations
-    iterations = iterations + 1
+        messages = list(messages) + [AIMessage(content=formatted_solution)]
+        # Increment iterations
+        iterations = iterations + 1
     
     return {
         "generation": code_solution, 
         "messages": messages, 
         "iterations": iterations,
-        "error": ""  # Reset error state
+        "error": "" if code_solution is not None else error  # Only reset error if code_solution exists
     }
 
 
@@ -218,6 +225,10 @@ async def check_code(
         Dict: A dictionary with test results and potential error information.
     """
     print("---CHECKING CODE---")
+    
+    # Guard: if the special intro error flag is set, end immediately
+    if state.error == "__intro__":
+        return {"error": "__intro__"}
     
     # Get state components
     code_solution = state.generation
@@ -294,11 +305,8 @@ async def reflect(
     )
     
     # Add reflection to messages
-    messages += [
-        (
-            "assistant",
-            f"Here's my analysis of the error: {reflection.content}",
-        )
+    messages = list(messages) + [
+        AIMessage(content=f"Here's my analysis of the error: {reflection.content}")
     ]
     
     return {"messages": messages}
@@ -320,6 +328,11 @@ def decide_next_step(state: GraphState) -> str:
     # Get state components
     error = state.error
     iterations = state.iterations
+    
+    # End the graph if the special intro error flag is set
+    if error == "__intro__":
+        print("---DECISION: END AFTER INTRO---")
+        return "end"
     
     # Decision logic
     if not error:
