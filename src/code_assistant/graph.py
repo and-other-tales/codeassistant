@@ -57,9 +57,60 @@ def _github_repo_ingest_run(repo_url: str) -> str:
 
 async def _github_repo_ingest_async_run(repo_url: str) -> str:
     """Run GitHub repository ingestion asynchronously."""
+    from code_assistant.configuration import Configuration
+    import os
+    import logging
+    
+    logger = logging.getLogger(__name__)
+    
     if not repo_url:
         raise ValueError("repo_url is required")
-    return f"Started ingestion of GitHub repository: {repo_url}"
+    
+    # Check if test mode is enabled
+    test_mode = os.environ.get("TEST_MODE", "").lower() == "true"
+    
+    # Get configuration from environment variables
+    mongodb_uri = os.environ.get("MONGODB_URI", "mongodb://localhost:27017/test" if test_mode else "")
+    pinecone_index = os.environ.get("PINECONE_INDEX", "test-index" if test_mode else "")
+    pinecone_api_key = os.environ.get("PINECONE_API_KEY", "test-api-key" if test_mode else "")
+    embedding_model_name = os.environ.get("EMBEDDING_MODEL_NAME", "all-MiniLM-L6-v2")
+    
+    # Check if required configuration is available and not in test mode
+    if not test_mode and not all([mongodb_uri, pinecone_index, pinecone_api_key]):
+        missing_vars = []
+        if not mongodb_uri: missing_vars.append("MONGODB_URI")
+        if not pinecone_index: missing_vars.append("PINECONE_INDEX")
+        if not pinecone_api_key: missing_vars.append("PINECONE_API_KEY")
+        
+        error_msg = f"Missing required environment variables: {', '.join(missing_vars)}"
+        logger.error(error_msg)
+        return f"Error: {error_msg}. GitHub repository ingestion cannot proceed."
+    
+    # Start the ingestion process
+    logger.info(f"Starting ingestion of GitHub repository: {repo_url}{' (TEST MODE)' if test_mode else ''}")
+    
+    try:
+        from code_assistant.utils import ingest_github_repo
+        
+        # Trigger the ingestion (this is non-blocking since it uses asyncio.to_thread)
+        ingestion_started = await ingest_github_repo(
+            repo_url=repo_url,
+            mongodb_uri=mongodb_uri,
+            pinecone_index=pinecone_index,
+            pinecone_api_key=pinecone_api_key,
+            embedding_model_name=embedding_model_name,
+            test_mode=test_mode
+        )
+        
+        if ingestion_started:
+            return f"Successfully started ingestion of GitHub repository: {repo_url}"
+        else:
+            return f"Failed to start ingestion of GitHub repository: {repo_url}"
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        logger.error(f"Error during GitHub repository ingestion: {e}\n{error_details}")
+        return f"Error during GitHub repository ingestion: {str(e)}"
 
 # Create the tool using the function-based approach
 IngestGithubRepo = Tool(

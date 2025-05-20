@@ -16,6 +16,9 @@ from code_assistant.graph import IngestGithubRepo
 from code_assistant.tools import build_agent_tools
 from code_assistant.utils import load_chat_model
 
+# Set environment variables for testing
+os.environ["TEST_MODE"] = "true"
+
 async def test_tool_properties():
     """Test the tool's basic properties."""
     try:
@@ -39,7 +42,7 @@ async def test_tool_execution():
         # Test with proper argument
         print("\nTesting with valid repo_url:")
         # Use async version of tool invocation
-        result = await IngestGithubRepo.ainvoke({"repo_url": "https://github.com/langchain-ai/langchain"})
+        result = await IngestGithubRepo.ainvoke({"repo_url": "https://github.com/langchain-ai/langserve"})
         print(f"Result: {result}")
         
         # Test with empty argument - should fail

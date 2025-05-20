@@ -48,6 +48,7 @@ from langchain_openai import OpenAIEmbeddings
 from langchain_mongodb import MongoDBAtlasVectorSearch
 from pymongo import MongoClient
 import nbformat
+from git.exc import GitCommandError
 
 # Handle different versions of Pinecone SDK
 try:
@@ -398,8 +399,20 @@ def get_document_from_mongodb(doc_id: str):
     if not MONGODB_URI:
         return None
     client = MongoClient(MONGODB_URI)
-    db = client["codeassist"]  # Specify the database name
-    collection = db["docs"]  # Specify the collection name
+    
+    # Extract database name from URI or use default
+    if "?" in MONGODB_URI:
+        uri_parts = MONGODB_URI.split("?")[0]
+    else:
+        uri_parts = MONGODB_URI
+        
+    # Parse the database name from the URI
+    db_name = uri_parts.split("/")[-1]
+    if not db_name or db_name == "":
+        db_name = "codeassistant"  # Default database name
+    
+    db = client[db_name]
+    collection = db.documents
     doc = collection.find_one({"_id": doc_id})
     if not doc:
         return None
@@ -411,7 +424,8 @@ async def ingest_github_repo(
     mongodb_uri: str,
     pinecone_index: str,
     pinecone_api_key: str,
-    embedding_model_name: str
+    embedding_model_name: str,
+    test_mode: bool = False
 ) -> bool:
     """Ingest a GitHub repository into the document storage.
     
@@ -421,6 +435,7 @@ async def ingest_github_repo(
         pinecone_index: Name of the Pinecone index to use
         pinecone_api_key: Pinecone API key
         embedding_model_name: Name of the embedding model to use
+        test_mode: If True, skip actual database operations (for testing)
         
     Returns:
         bool: True if ingestion was successful, False otherwise
@@ -435,6 +450,8 @@ async def ingest_github_repo(
         from pymongo import MongoClient
         from langchain_community.embeddings import HuggingFaceEmbeddings
         import tempfile
+        import git
+        from git.exc import GitCommandError
         
         # Extract repo owner and name from URL
         repo_parts = repo_url.strip('/').split('/')
@@ -450,11 +467,40 @@ async def ingest_github_repo(
             # Create a temporary directory for cloning the repo
             with tempfile.TemporaryDirectory() as temp_dir:
                 try:
-                    # Clone the repository using GitLoader
+                    # First clone the repository to detect available branches
+                    repo = git.Repo.clone_from(repo_url, temp_dir)
+                    
+                    # Get list of available branches
+                    available_branches = [ref.name for ref in repo.references if ref.name != 'HEAD']
+                    logger.info(f"Available branches: {available_branches}")
+                    
+                    # Determine which branch to use - try common names
+                    branch_options = ['main', 'master', 'develop', 'development']
+                    selected_branch = None
+                    
+                    for branch in branch_options:
+                        remote_branch = f'origin/{branch}'
+                        if remote_branch in available_branches or branch in available_branches:
+                            selected_branch = branch
+                            break
+                    
+                    if not selected_branch and available_branches:
+                        # If none of our preferred branches exist, use the first available branch
+                        selected_branch = available_branches[0]
+                        if selected_branch.startswith('origin/'):
+                            selected_branch = selected_branch[7:]  # Strip 'origin/' prefix
+                    
+                    if not selected_branch:
+                        logger.error(f"No branches found in repository {repo_url}")
+                        return False
+                        
+                    logger.info(f"Using branch: {selected_branch}")
+                    
+                    # Use GitLoader with the selected branch
                     loader = GitLoader(
                         clone_url=repo_url,
                         repo_path=temp_dir,
-                        branch="main"
+                        branch=selected_branch
                     )
                     
                     # Load and split documents
@@ -467,7 +513,8 @@ async def ingest_github_repo(
                             "source": "github",
                             "repo_owner": repo_owner,
                             "repo_name": repo_name,
-                            "module": repo_name
+                            "module": repo_name,
+                            "branch": selected_branch
                         })
                         doc.metadata = metadata
                     
@@ -478,9 +525,26 @@ async def ingest_github_repo(
                     )
                     chunks = text_splitter.split_documents(documents)
                     
+                    # Skip database operations in test mode
+                    if test_mode:
+                        logger.info(f"Test mode: Successfully processed {len(chunks)} chunks from {repo_owner}/{repo_name}")
+                        return True
+                    
                     # Initialize MongoDB client
                     client = MongoClient(mongodb_uri)
-                    db = client.get_default_database()
+                    
+                    # Extract database name from URI or use default
+                    if "?" in mongodb_uri:
+                        uri_parts = mongodb_uri.split("?")[0]
+                    else:
+                        uri_parts = mongodb_uri
+                        
+                    # Parse the database name from the URI
+                    db_name = uri_parts.split("/")[-1]
+                    if not db_name or db_name == "":
+                        db_name = "codeassistant"  # Default database name
+                    
+                    db = client[db_name]
                     collection = db.documents
                     
                     # Check if documents from this repo already exist
@@ -514,8 +578,13 @@ async def ingest_github_repo(
                     logger.info(f"Successfully ingested {len(chunks)} chunks from {repo_owner}/{repo_name}")
                     return True
                     
+                except GitCommandError as git_error:
+                    logger.error(f"Git command error: {git_error}")
+                    return False
                 except Exception as e:
                     logger.error(f"Error cloning or processing repository: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
                     return False
                 
         # Run the blocking operations in a separate thread to avoid blocking the event loop
@@ -523,4 +592,6 @@ async def ingest_github_repo(
         
     except Exception as e:
         logger.error(f"Error in ingest_github_repo: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return False
