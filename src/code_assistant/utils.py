@@ -489,6 +489,7 @@ def run_code_in_pyodide_sandbox(code: str, allow_net: bool = False):
     finally:
         shutil.rmtree(sessions_dir, ignore_errors=True)
 
+
 # --- CODEACT AGENT INTEGRATION ---
 
 def create_codeact_agent(model, tools, allow_net: bool = False):
@@ -511,6 +512,7 @@ def create_codeact_agent(model, tools, allow_net: bool = False):
     agent = code_act.compile(checkpointer=MemorySaver())
     return agent
 
+
 # --- EXAMPLE TEST TEMPLATE ---
 
 def test_generated_code_with_codeact(model, tools, code: str, expected_output: str):
@@ -524,3 +526,47 @@ def test_generated_code_with_codeact(model, tools, code: str, expected_output: s
     # result is typically a list of message dicts; check all for expected output
     found = any(expected_output in (msg.get("content", "") or str(msg)) for msg in (result if isinstance(result, list) else [result]))
     assert found, f"Expected output not found. Got: {result}"
+
+
+def get_github_tools(user_consent: bool = False):
+    """
+    Conditionally load GitHubToolkit tools if the user has provided GitHub credentials and consented.
+    Returns a list of GitHub tools, or an empty list if not enabled.
+    """
+    if not user_consent:
+        return []
+    required_env = ["GITHUB_APP_ID", "GITHUB_APP_PRIVATE_KEY", "GITHUB_REPOSITORY"]
+    if not all(os.getenv(var) for var in required_env):
+        return []
+    try:
+        from langchain_community.agent_toolkits.github.toolkit import GitHubToolkit
+        from langchain_community.utilities.github import GitHubAPIWrapper
+        github = GitHubAPIWrapper()
+        toolkit = GitHubToolkit.from_github_api_wrapper(github)
+        return toolkit.get_tools()
+    except ImportError:
+        return []
+
+
+def is_tool_use_supported(model_name: str) -> bool:
+    """
+    Returns True if the model supports tool use (function calling), e.g. ChatGroq Llama4, OpenAI GPT-4o, etc.
+    Update this as new models are supported.
+    """
+    # Groq Llama-3/4, OpenAI GPT-4o, etc. (update as needed)
+    model_name = model_name.lower()
+    return any(
+        kw in model_name for kw in ["llama-4", "llama-3", "gpt-4o", "gpt-4-turbo", "tool-use"]
+    )
+
+
+def build_agent_tools(user_tools: list, github_tools: list = None, ingestion_tools: list = None) -> list:
+    """
+    Build the list of tools to pass to the agent, including user, github, and ingestion tools.
+    """
+    tools = list(user_tools) if user_tools else []
+    if github_tools:
+        tools.extend(github_tools)
+    if ingestion_tools:
+        tools.extend(ingestion_tools)
+    return tools
